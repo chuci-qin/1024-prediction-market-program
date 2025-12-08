@@ -1,0 +1,32 @@
+[package]
+name = "prediction-market-program"
+version = "0.1.0"
+edition = "2021"
+description = "1024 Prediction Market Program - Core logic for prediction market trading"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "prediction_market_program"
+
+[features]
+default = []
+no-entrypoint = []
+test-sbf = []
+cpi = ["no-entrypoint"]
+
+[dependencies]
+solana-program = "1.18"
+borsh = "0.10"
+borsh-derive = "0.10"
+thiserror = "1.0"
+num-derive = "0.4"
+num-traits = "0.2"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "2.3", features = ["no-entrypoint"] }
+
+[dev-dependencies]
+solana-program-test = "1.18"
+solana-sdk = "1.18"
+tokio = { version = "1", features = ["full"] }
+
