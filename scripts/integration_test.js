@@ -26,7 +26,7 @@ const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createAssociatedTokenAccoun
 const fs = require('fs');
 const crypto = require('crypto');
 
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
 const USDC_MINT = new PublicKey('7pCrfxhcAEyTFDhrhKRtRS2iMvEYx2dtNE7NzwuU7SA9');
 
 // Seeds

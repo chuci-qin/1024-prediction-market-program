@@ -14,7 +14,7 @@ const {
 const fs = require('fs');
 
 // Program IDs
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
 
 // Seeds
 const PM_CONFIG_SEED = Buffer.from('pm_config');

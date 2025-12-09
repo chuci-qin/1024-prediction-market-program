@@ -18,17 +18,17 @@ use crate::error::PredictionMarketError;
 use crate::instruction::PredictionMarketInstruction;
 use crate::state::{
     PredictionMarketConfig, Market, Order, Position, OracleProposal,
-    MarketStatus, MarketResult, ReviewStatus, OrderStatus, ProposalStatus,
+    MarketType, MarketStatus, MarketResult, ReviewStatus, OrderStatus, ProposalStatus,
     PM_CONFIG_SEED, MARKET_SEED, ORDER_SEED, ORDER_ESCROW_SEED, POSITION_SEED, 
-    MARKET_VAULT_SEED, YES_MINT_SEED, NO_MINT_SEED, ORACLE_PROPOSAL_SEED,
+    MARKET_VAULT_SEED, YES_MINT_SEED, NO_MINT_SEED, ORACLE_PROPOSAL_SEED, OUTCOME_MINT_SEED,
     PM_CONFIG_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORDER_DISCRIMINATOR, 
     POSITION_DISCRIMINATOR, ORACLE_PROPOSAL_DISCRIMINATOR,
-    PRICE_PRECISION,
+    PRICE_PRECISION, MIN_PRICE, MAX_PRICE,
 };
 use crate::utils::{
-    check_signer, verify_pda, get_current_timestamp, create_pda_account,
-    safe_add_i64, safe_sub_i64, safe_mul_u64, safe_div_u64,
-    calculate_fee, validate_price, validate_price_pair,
+    check_signer, get_current_timestamp,
+    safe_add_u64,
+    validate_price, validate_price_pair,
     deserialize_account,
 };
 
@@ -157,6 +157,74 @@ pub fn process_instruction(
         PredictionMarketInstruction::RemoveAuthorizedCaller(args) => {
             msg!("Instruction: RemoveAuthorizedCaller");
             process_remove_authorized_caller(program_id, accounts, args)
+        }
+        
+        // Multi-Outcome Market Instructions
+        PredictionMarketInstruction::CreateMultiOutcomeMarket(args) => {
+            msg!("Instruction: CreateMultiOutcomeMarket");
+            process_create_multi_outcome_market(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::MintMultiOutcomeCompleteSet(args) => {
+            msg!("Instruction: MintMultiOutcomeCompleteSet");
+            process_mint_multi_outcome_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RedeemMultiOutcomeCompleteSet(args) => {
+            msg!("Instruction: RedeemMultiOutcomeCompleteSet");
+            process_redeem_multi_outcome_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::PlaceMultiOutcomeOrder(args) => {
+            msg!("Instruction: PlaceMultiOutcomeOrder");
+            process_place_multi_outcome_order(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ProposeMultiOutcomeResult(args) => {
+            msg!("Instruction: ProposeMultiOutcomeResult");
+            process_propose_multi_outcome_result(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ClaimMultiOutcomeWinnings(args) => {
+            msg!("Instruction: ClaimMultiOutcomeWinnings");
+            process_claim_multi_outcome_winnings(program_id, accounts, args)
+        }
+        
+        // === Relayer Instructions ===
+        PredictionMarketInstruction::RelayerMintCompleteSet(args) => {
+            msg!("Instruction: RelayerMintCompleteSet");
+            process_relayer_mint_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRedeemCompleteSet(args) => {
+            msg!("Instruction: RelayerRedeemCompleteSet");
+            process_relayer_redeem_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerPlaceOrder(args) => {
+            msg!("Instruction: RelayerPlaceOrder");
+            process_relayer_place_order(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerCancelOrder(args) => {
+            msg!("Instruction: RelayerCancelOrder");
+            process_relayer_cancel_order(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerClaimWinnings(args) => {
+            msg!("Instruction: RelayerClaimWinnings");
+            process_relayer_claim_winnings(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRefundCancelledMarket(args) => {
+            msg!("Instruction: RelayerRefundCancelledMarket");
+            process_relayer_refund_cancelled_market(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerMintMultiOutcomeCompleteSet(args) => {
+            msg!("Instruction: RelayerMintMultiOutcomeCompleteSet");
+            process_relayer_mint_multi_outcome_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRedeemMultiOutcomeCompleteSet(args) => {
+            msg!("Instruction: RelayerRedeemMultiOutcomeCompleteSet");
+            process_relayer_redeem_multi_outcome_complete_set(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerPlaceMultiOutcomeOrder(args) => {
+            msg!("Instruction: RelayerPlaceMultiOutcomeOrder");
+            process_relayer_place_multi_outcome_order(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerClaimMultiOutcomeWinnings(args) => {
+            msg!("Instruction: RelayerClaimMultiOutcomeWinnings");
+            process_relayer_claim_multi_outcome_winnings(program_id, accounts, args)
         }
     }
 }
@@ -492,6 +560,8 @@ fn process_create_market(
     let market = Market {
         discriminator: MARKET_DISCRIMINATOR,
         market_id,
+        market_type: MarketType::Binary, // Binary market
+        num_outcomes: 2, // YES/NO
         creator: *creator_info.key,
         question_hash: args.question_hash,
         resolution_spec_hash: args.resolution_spec_hash,
@@ -503,6 +573,7 @@ fn process_create_market(
         resolution_time: args.resolution_time,
         finalization_deadline: args.finalization_deadline,
         final_result: None,
+        winning_outcome_index: None, // For multi-outcome markets
         created_at: current_time,
         updated_at: current_time,
         total_minted: 0,
@@ -511,7 +582,7 @@ fn process_create_market(
         creator_fee_bps: args.creator_fee_bps,
         next_order_id: 1,
         bump: market_bump,
-        reserved: [0u8; 64],
+        reserved: [0u8; 60],
     };
     
     market.serialize(&mut *market_info.data.borrow_mut())?;
@@ -3213,6 +3284,1502 @@ fn process_remove_authorized_caller(
     // For now, this is a placeholder
     msg!("Authorized caller removed (placeholder)");
     msg!("Caller: {}", args.caller);
+    
+    Ok(())
+}
+
+// ============================================================================
+// Multi-Outcome Market Processors
+// ============================================================================
+
+fn process_create_multi_outcome_market(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: CreateMultiOutcomeMarketArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Creator (signer)
+    let creator_info = next_account_info(account_info_iter)?;
+    check_signer(creator_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market PDA
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Market Vault PDA
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: USDC Mint
+    let usdc_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Rent Sysvar
+    let rent_info = next_account_info(account_info_iter)?;
+    
+    // Validate num_outcomes
+    if args.num_outcomes < 2 || args.num_outcomes > 32 {
+        msg!("Number of outcomes must be between 2 and 32");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    if args.outcome_hashes.len() != args.num_outcomes as usize {
+        msg!("Outcome hashes count must match num_outcomes");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate creator fee
+    if args.creator_fee_bps > 500 {
+        msg!("Creator fee cannot exceed 5%");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Load config
+    msg!("Loading config from account: {}", config_info.key);
+    msg!("Config account data len: {}", config_info.data.borrow().len());
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    msg!("Config loaded successfully");
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        msg!("Invalid discriminator");
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    msg!("Discriminator valid");
+    
+    // Check if paused
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    msg!("Config not paused");
+    
+    let market_id = config.next_market_id;
+    msg!("Next market ID: {}", market_id);
+    let market_id_bytes = market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Verify Market PDA
+    let (market_pda, market_bump) = Pubkey::find_program_address(
+        &[MARKET_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *market_info.key != market_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Verify Market Vault PDA
+    let (market_vault_pda, market_vault_bump) = Pubkey::find_program_address(
+        &[MARKET_VAULT_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *market_vault_info.key != market_vault_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let rent = Rent::get()?;
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market_bump]];
+    
+    // Create Market account
+    let market_space = Market::SIZE;
+    let market_lamports = rent.minimum_balance(market_space);
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            creator_info.key,
+            market_info.key,
+            market_lamports,
+            market_space as u64,
+            program_id,
+        ),
+        &[creator_info.clone(), market_info.clone(), system_program_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Create outcome token mints
+    let mint_space = spl_token::state::Mint::LEN;
+    let mint_lamports = rent.minimum_balance(mint_space);
+    
+    for outcome_idx in 0..args.num_outcomes {
+        let outcome_mint_info = next_account_info(account_info_iter)?;
+        
+        // Verify outcome mint PDA
+        let (outcome_mint_pda, outcome_mint_bump) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[outcome_idx]],
+            program_id,
+        );
+        if *outcome_mint_info.key != outcome_mint_pda {
+            msg!("Invalid outcome mint PDA for outcome {}", outcome_idx);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        let outcome_mint_seeds: &[&[u8]] = &[OUTCOME_MINT_SEED, &market_id_bytes, &[outcome_idx], &[outcome_mint_bump]];
+        
+        // Create outcome mint
+        invoke_signed(
+            &system_instruction::create_account(
+                creator_info.key,
+                outcome_mint_info.key,
+                mint_lamports,
+                mint_space as u64,
+                token_program_info.key,
+            ),
+            &[creator_info.clone(), outcome_mint_info.clone(), system_program_info.clone()],
+            &[outcome_mint_seeds],
+        )?;
+        
+        // Initialize outcome mint (authority = Market PDA)
+        invoke_signed(
+            &spl_token::instruction::initialize_mint(
+                token_program_info.key,
+                outcome_mint_info.key,
+                market_info.key, // mint_authority
+                Some(market_info.key), // freeze_authority
+                6, // decimals
+            )?,
+            &[outcome_mint_info.clone(), rent_info.clone()],
+            &[market_seeds],
+        )?;
+        
+        msg!("Created outcome {} mint: {}", outcome_idx, outcome_mint_info.key);
+    }
+    
+    // Create Market Vault (USDC Token Account)
+    let vault_space = spl_token::state::Account::LEN;
+    let vault_lamports = rent.minimum_balance(vault_space);
+    let market_vault_seeds: &[&[u8]] = &[MARKET_VAULT_SEED, &market_id_bytes, &[market_vault_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            creator_info.key,
+            market_vault_info.key,
+            vault_lamports,
+            vault_space as u64,
+            token_program_info.key,
+        ),
+        &[creator_info.clone(), market_vault_info.clone(), system_program_info.clone()],
+        &[market_vault_seeds],
+    )?;
+    
+    // Initialize Market Vault (owner = Market PDA)
+    invoke_signed(
+        &spl_token::instruction::initialize_account(
+            token_program_info.key,
+            market_vault_info.key,
+            usdc_mint_info.key,
+            market_info.key, // owner
+        )?,
+        &[market_vault_info.clone(), usdc_mint_info.clone(), market_info.clone(), rent_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Initialize Market data
+    let market = Market {
+        discriminator: MARKET_DISCRIMINATOR,
+        market_id,
+        market_type: MarketType::MultiOutcome,
+        num_outcomes: args.num_outcomes,
+        creator: *creator_info.key,
+        question_hash: args.question_hash,
+        resolution_spec_hash: args.resolution_spec_hash,
+        yes_mint: Pubkey::default(), // Not used for multi-outcome
+        no_mint: Pubkey::default(),  // Not used for multi-outcome
+        market_vault: *market_vault_info.key,
+        status: MarketStatus::Pending,
+        review_status: ReviewStatus::None,
+        resolution_time: args.resolution_time,
+        finalization_deadline: args.finalization_deadline,
+        final_result: None,
+        winning_outcome_index: None,
+        created_at: current_time,
+        updated_at: current_time,
+        total_minted: 0,
+        total_volume_e6: 0,
+        open_interest: 0,
+        creator_fee_bps: args.creator_fee_bps,
+        next_order_id: 1,
+        bump: market_bump,
+        reserved: [0u8; 60],
+    };
+    
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // Update config
+    config.next_market_id += 1;
+    config.total_markets += 1;
+    config.serialize(&mut *config_info.data.borrow_mut())?;
+    
+    msg!("Multi-outcome market created successfully");
+    msg!("Market ID: {}", market_id);
+    msg!("Creator: {}", creator_info.key);
+    msg!("Num Outcomes: {}", args.num_outcomes);
+    msg!("Market Vault: {}", market_vault_info.key);
+    msg!("Resolution Time: {}", args.resolution_time);
+    msg!("Creator Fee: {} bps", args.creator_fee_bps);
+    
+    Ok(())
+}
+
+fn process_mint_multi_outcome_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MintMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: User (signer)
+    let user_info = next_account_info(account_info_iter)?;
+    check_signer(user_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Market Vault
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User USDC Account
+    let user_usdc_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: User Position PDA
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("This market is not a multi-outcome market");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotActive.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Transfer USDC from user to market vault (1 USDC per complete set)
+    invoke(
+        &spl_token::instruction::transfer(
+            token_program_info.key,
+            user_usdc_info.key,
+            market_vault_info.key,
+            user_info.key,
+            &[],
+            args.amount,
+        )?,
+        &[user_usdc_info.clone(), market_vault_info.clone(), user_info.clone()],
+    )?;
+    
+    // Mint 1 token of each outcome to user
+    for outcome_idx in 0..market.num_outcomes {
+        let outcome_mint_info = next_account_info(account_info_iter)?;
+        let user_outcome_token_info = next_account_info(account_info_iter)?;
+        
+        // Verify outcome mint PDA
+        let (outcome_mint_pda, _) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[outcome_idx]],
+            program_id,
+        );
+        if *outcome_mint_info.key != outcome_mint_pda {
+            msg!("Invalid outcome mint for index {}", outcome_idx);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Mint tokens to user
+        invoke_signed(
+            &spl_token::instruction::mint_to(
+                token_program_info.key,
+                outcome_mint_info.key,
+                user_outcome_token_info.key,
+                market_info.key, // mint authority
+                &[],
+                args.amount,
+            )?,
+            &[outcome_mint_info.clone(), user_outcome_token_info.clone(), market_info.clone()],
+            &[market_seeds],
+        )?;
+    }
+    
+    // Update market stats
+    market.total_minted += args.amount;
+    market.updated_at = get_current_timestamp()?;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("Multi-outcome complete set minted");
+    msg!("Market ID: {}", args.market_id);
+    msg!("Amount: {}", args.amount);
+    msg!("User: {}", user_info.key);
+    
+    Ok(())
+}
+
+fn process_redeem_multi_outcome_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RedeemMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: User (signer)
+    let user_info = next_account_info(account_info_iter)?;
+    check_signer(user_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Market Vault
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User USDC Account
+    let user_usdc_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: User Position PDA
+    let _position_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("This market is not a multi-outcome market");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotActive.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Burn 1 token of each outcome from user
+    for outcome_idx in 0..market.num_outcomes {
+        let outcome_mint_info = next_account_info(account_info_iter)?;
+        let user_outcome_token_info = next_account_info(account_info_iter)?;
+        
+        // Verify outcome mint PDA
+        let (outcome_mint_pda, _) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[outcome_idx]],
+            program_id,
+        );
+        if *outcome_mint_info.key != outcome_mint_pda {
+            msg!("Invalid outcome mint for index {}", outcome_idx);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Burn tokens from user
+        invoke(
+            &spl_token::instruction::burn(
+                token_program_info.key,
+                user_outcome_token_info.key,
+                outcome_mint_info.key,
+                user_info.key,
+                &[],
+                args.amount,
+            )?,
+            &[user_outcome_token_info.clone(), outcome_mint_info.clone(), user_info.clone()],
+        )?;
+    }
+    
+    // Transfer USDC from market vault to user
+    invoke_signed(
+        &spl_token::instruction::transfer(
+            token_program_info.key,
+            market_vault_info.key,
+            user_usdc_info.key,
+            market_info.key, // vault authority
+            &[],
+            args.amount,
+        )?,
+        &[market_vault_info.clone(), user_usdc_info.clone(), market_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Update market stats
+    market.total_minted = market.total_minted.saturating_sub(args.amount);
+    market.updated_at = get_current_timestamp()?;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("Multi-outcome complete set redeemed");
+    msg!("Market ID: {}", args.market_id);
+    msg!("Amount: {}", args.amount);
+    msg!("User: {}", user_info.key);
+    
+    Ok(())
+}
+
+fn process_place_multi_outcome_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: PlaceMultiOutcomeOrderArgs,
+) -> ProgramResult {
+    use crate::state::{Order, OrderSide, Outcome, OrderType, OrderStatus, ORDER_DISCRIMINATOR};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: User (signer)
+    let user_info = next_account_info(account_info_iter)?;
+    check_signer(user_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Order PDA
+    let order_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Position PDA
+    let _position_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Outcome Mint
+    let _outcome_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: User Outcome Token Account
+    let _user_outcome_token_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Token Program
+    let _token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("This market is not a multi-outcome market");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotActive.into());
+    }
+    
+    // Validate outcome index
+    if args.outcome_index >= market.num_outcomes {
+        msg!("Invalid outcome index: {} >= {}", args.outcome_index, market.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate price
+    if args.price < MIN_PRICE || args.price > MAX_PRICE {
+        return Err(PredictionMarketError::InvalidPrice.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let order_id = market.next_order_id;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let order_id_bytes = order_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Verify Order PDA
+    let (order_pda, order_bump) = Pubkey::find_program_address(
+        &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+        program_id,
+    );
+    if *order_info.key != order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Create order account
+    let rent = Rent::get()?;
+    let order_space = Order::SIZE;
+    let order_lamports = rent.minimum_balance(order_space);
+    let order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &order_id_bytes, &[order_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            user_info.key,
+            order_info.key,
+            order_lamports,
+            order_space as u64,
+            program_id,
+        ),
+        &[user_info.clone(), order_info.clone(), system_program_info.clone()],
+        &[order_seeds],
+    )?;
+    
+    // Map outcome_index to Outcome enum (for compatibility)
+    let outcome = if args.outcome_index == 0 { Outcome::Yes } else { Outcome::No };
+    
+    // Initialize order
+    let order = Order {
+        discriminator: ORDER_DISCRIMINATOR,
+        order_id,
+        market_id: args.market_id,
+        owner: *user_info.key,
+        side: args.side,
+        outcome,
+        price: args.price,
+        amount: args.amount,
+        filled_amount: 0,
+        status: OrderStatus::Open,
+        order_type: OrderType::GTC,
+        expiration_time: args.expiration_time,
+        created_at: current_time,
+        updated_at: current_time,
+        bump: order_bump,
+        escrow_token_account: None,
+        reserved: [0u8; 31],
+    };
+    
+    order.serialize(&mut *order_info.data.borrow_mut())?;
+    
+    // Update market
+    market.next_order_id += 1;
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("Multi-outcome order placed");
+    msg!("Market ID: {}", args.market_id);
+    msg!("Order ID: {}", order_id);
+    msg!("Outcome Index: {}", args.outcome_index);
+    msg!("Side: {:?}", args.side);
+    msg!("Price: {}", args.price);
+    msg!("Amount: {}", args.amount);
+    
+    Ok(())
+}
+
+fn process_propose_multi_outcome_result(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ProposeMultiOutcomeResultArgs,
+) -> ProgramResult {
+    use crate::state::{OracleProposal, ProposalStatus, ORACLE_PROPOSAL_DISCRIMINATOR};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Oracle Admin (signer)
+    let oracle_admin_info = next_account_info(account_info_iter)?;
+    check_signer(oracle_admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Oracle Proposal PDA
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify oracle admin
+    if *oracle_admin_info.key != config.oracle_admin {
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("This market is not a multi-outcome market");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate winning outcome index
+    if args.winning_outcome_index >= market.num_outcomes {
+        msg!("Invalid winning outcome index: {} >= {}", args.winning_outcome_index, market.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    // Check if market can be resolved
+    if !market.can_resolve(current_time) {
+        return Err(PredictionMarketError::MarketNotResolvable.into());
+    }
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Verify proposal PDA
+    let (proposal_pda, proposal_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Create proposal account
+    let rent = Rent::get()?;
+    let proposal_space = OracleProposal::SIZE;
+    let proposal_lamports = rent.minimum_balance(proposal_space);
+    let proposal_seeds: &[&[u8]] = &[ORACLE_PROPOSAL_SEED, &market_id_bytes, &[proposal_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            oracle_admin_info.key,
+            proposal_info.key,
+            proposal_lamports,
+            proposal_space as u64,
+            program_id,
+        ),
+        &[oracle_admin_info.clone(), proposal_info.clone(), system_program_info.clone()],
+        &[proposal_seeds],
+    )?;
+    
+    // Initialize proposal (use MarketResult::Yes as placeholder since we're using winning_outcome_index)
+    let proposal = OracleProposal {
+        discriminator: ORACLE_PROPOSAL_DISCRIMINATOR,
+        market_id: args.market_id,
+        proposer: *oracle_admin_info.key,
+        proposed_result: MarketResult::Yes, // For multi-outcome, use winning_outcome_index instead
+        status: ProposalStatus::Pending,
+        proposed_at: current_time,
+        challenge_deadline: current_time + config.challenge_window_secs,
+        bond_amount: config.proposer_bond_e6,
+        challenger: None,
+        challenger_result: None,
+        challenger_bond: 0,
+        bump: proposal_bump,
+        reserved: [0u8; 32],
+    };
+    
+    proposal.serialize(&mut *proposal_info.data.borrow_mut())?;
+    
+    // Update market with winning outcome index
+    market.winning_outcome_index = Some(args.winning_outcome_index);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("Multi-outcome result proposed");
+    msg!("Market ID: {}", args.market_id);
+    msg!("Winning Outcome Index: {}", args.winning_outcome_index);
+    msg!("Challenge Deadline: {}", current_time + config.challenge_window_secs);
+    
+    Ok(())
+}
+
+fn process_claim_multi_outcome_winnings(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ClaimMultiOutcomeWinningsArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: User (signer)
+    let user_info = next_account_info(account_info_iter)?;
+    check_signer(user_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: User Position PDA
+    let _position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Winning Outcome Token Account
+    let user_winning_token_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Winning Outcome Mint
+    let winning_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Market Vault
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: User USDC Account
+    let user_usdc_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Load and validate market
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("This market is not a multi-outcome market");
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Verify market is resolved
+    if market.status != MarketStatus::Resolved {
+        return Err(PredictionMarketError::MarketNotResolved.into());
+    }
+    
+    // Get winning outcome
+    let winning_outcome_index = market.winning_outcome_index
+        .ok_or(PredictionMarketError::MarketNotResolved)?;
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Verify winning mint PDA
+    let (winning_mint_pda, _) = Pubkey::find_program_address(
+        &[OUTCOME_MINT_SEED, &market_id_bytes, &[winning_outcome_index]],
+        program_id,
+    );
+    if *winning_mint_info.key != winning_mint_pda {
+        msg!("Invalid winning mint PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Get user's winning token balance
+    let user_winning_token_account = spl_token::state::Account::unpack(
+        &user_winning_token_info.data.borrow()
+    )?;
+    let winning_amount = user_winning_token_account.amount;
+    
+    if winning_amount == 0 {
+        msg!("No winning tokens to claim");
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    // Burn user's winning tokens
+    invoke(
+        &spl_token::instruction::burn(
+            token_program_info.key,
+            user_winning_token_info.key,
+            winning_mint_info.key,
+            user_info.key,
+            &[],
+            winning_amount,
+        )?,
+        &[user_winning_token_info.clone(), winning_mint_info.clone(), user_info.clone()],
+    )?;
+    
+    // Transfer USDC from market vault to user (1 USDC per winning token)
+    invoke_signed(
+        &spl_token::instruction::transfer(
+            token_program_info.key,
+            market_vault_info.key,
+            user_usdc_info.key,
+            market_info.key, // vault authority
+            &[],
+            winning_amount,
+        )?,
+        &[market_vault_info.clone(), user_usdc_info.clone(), market_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    msg!("Multi-outcome winnings claimed");
+    msg!("Market ID: {}", args.market_id);
+    msg!("Winning Outcome Index: {}", winning_outcome_index);
+    msg!("Amount: {}", winning_amount);
+    msg!("User: {}", user_info.key);
+    
+    Ok(())
+}
+
+// ============================================================================
+// Relayer Instructions - Admin/Relayer 代替用户签名
+// ============================================================================
+
+/// 验证调用者是否为 Admin 或授权的 Relayer
+fn verify_relayer(config: &PredictionMarketConfig, relayer: &Pubkey) -> Result<(), ProgramError> {
+    // Admin 和 Oracle Admin 都可以作为 Relayer
+    if relayer == &config.admin || relayer == &config.oracle_admin {
+        return Ok(());
+    }
+    msg!("Error: Caller {} is not an authorized relayer", relayer);
+    Err(PredictionMarketError::Unauthorized.into())
+}
+
+/// Relayer 版本的 MintCompleteSet
+/// Relayer 代替用户签名，从用户的 Vault 余额扣款，铸造代币给用户
+fn process_relayer_mint_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMintCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer) - 代替用户签名
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Market Vault (writable)
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: YES Token Mint (writable)
+    let yes_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: NO Token Mint (writable)
+    let no_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: User's YES Token Account (writable)
+    let user_yes_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: User's NO Token Account (writable)
+    let user_no_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: User Vault Account (Vault Program) - 用于扣款
+    let user_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 12: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 13: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // 验证 Relayer 权限
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // TODO: CPI to Vault Program to deduct from user's vault balance
+    // For now, we skip the USDC transfer as it will be handled differently
+    msg!("⚠️ Relayer mint: Vault CPI deduction to be implemented");
+    
+    // Mint YES tokens to user
+    invoke_signed(
+        &spl_token::instruction::mint_to(
+            token_program_info.key,
+            yes_mint_info.key,
+            user_yes_info.key,
+            market_info.key,
+            &[],
+            args.amount,
+        )?,
+        &[yes_mint_info.clone(), user_yes_info.clone(), market_info.clone(), token_program_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Mint NO tokens to user
+    invoke_signed(
+        &spl_token::instruction::mint_to(
+            token_program_info.key,
+            no_mint_info.key,
+            user_no_info.key,
+            market_info.key,
+            &[],
+            args.amount,
+        )?,
+        &[no_mint_info.clone(), user_no_info.clone(), market_info.clone(), token_program_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Load or create Position - Relayer pays for account creation
+    let (position_pda, position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    if position_info.data_is_empty() {
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref(), &[position_bump]];
+        
+        // Relayer pays for account creation
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,  // Relayer pays
+                position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+        
+        let position = Position::new(market.market_id, args.user_wallet, position_bump, current_time);
+        let mut data = position_info.try_borrow_mut_data()?;
+        position.serialize(&mut data.as_mut())?;
+    }
+    
+    // Update market stats
+    market.total_minted = safe_add_u64(market.total_minted, args.amount)?;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerMintCompleteSet completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
+    msg!("Amount: {}", args.amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 RedeemCompleteSet
+fn process_relayer_redeem_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRedeemCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let market_vault_info = next_account_info(account_info_iter)?;
+    let yes_mint_info = next_account_info(account_info_iter)?;
+    let no_mint_info = next_account_info(account_info_iter)?;
+    let user_yes_info = next_account_info(account_info_iter)?;
+    let user_no_info = next_account_info(account_info_iter)?;
+    let position_info = next_account_info(account_info_iter)?;
+    let user_vault_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let market_id_bytes = market.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Burn YES tokens from user (user already authorized via Relayer)
+    // Note: This requires the token account to have delegated authority to the market
+    // For simplicity, we use the market as authority via PDA signing
+    invoke_signed(
+        &spl_token::instruction::burn(
+            token_program_info.key,
+            user_yes_info.key,
+            yes_mint_info.key,
+            market_info.key,  // Market as burn authority
+            &[],
+            args.amount,
+        )?,
+        &[user_yes_info.clone(), yes_mint_info.clone(), market_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Burn NO tokens
+    invoke_signed(
+        &spl_token::instruction::burn(
+            token_program_info.key,
+            user_no_info.key,
+            no_mint_info.key,
+            market_info.key,
+            &[],
+            args.amount,
+        )?,
+        &[user_no_info.clone(), no_mint_info.clone(), market_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // TODO: CPI to Vault to credit user's balance
+    msg!("⚠️ Relayer redeem: Vault CPI credit to be implemented");
+    
+    market.total_minted = market.total_minted.saturating_sub(args.amount);
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerRedeemCompleteSet completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Amount: {}", args.amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 PlaceOrder
+fn process_relayer_place_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerPlaceOrderArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let order_info = next_account_info(account_info_iter)?;
+    let position_info = next_account_info(account_info_iter)?;
+    let user_vault_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Validate price
+    validate_price(args.price)?;
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Get next order ID
+    let order_id = market.next_order_id;
+    market.next_order_id = market.next_order_id.saturating_add(1);
+    
+    // Derive Order PDA
+    let order_id_bytes = order_id.to_le_bytes();
+    let (order_pda, order_bump) = Pubkey::find_program_address(
+        &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+        program_id,
+    );
+    
+    if *order_info.key != order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Create Order account - Relayer pays
+    let rent = Rent::get()?;
+    let space = Order::SIZE;
+    let lamports = rent.minimum_balance(space);
+    let order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &order_id_bytes, &[order_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            relayer_info.key,
+            order_info.key,
+            lamports,
+            space as u64,
+            program_id,
+        ),
+        &[relayer_info.clone(), order_info.clone(), system_program_info.clone()],
+        &[order_seeds],
+    )?;
+    
+    // Initialize Order
+    let order = Order {
+        discriminator: ORDER_DISCRIMINATOR,
+        order_id,
+        market_id: args.market_id,
+        owner: args.user_wallet,
+        side: args.side,
+        outcome: args.outcome,
+        price: args.price,
+        amount: args.amount,
+        filled_amount: 0,
+        status: OrderStatus::Open,
+        order_type: args.order_type,
+        expiration_time: args.expiration_time,
+        created_at: current_time,
+        updated_at: current_time,
+        bump: order_bump,
+        escrow_token_account: None,
+        reserved: [0u8; 31],
+    };
+    
+    order.serialize(&mut *order_info.data.borrow_mut())?;
+    
+    // Update market stats
+    market.open_interest = market.open_interest.saturating_add(1);
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // TODO: Lock margin via Vault CPI
+    msg!("⚠️ Relayer place order: Vault margin lock to be implemented");
+    
+    msg!("✅ RelayerPlaceOrder completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Order ID: {}", order_id);
+    msg!("Side: {:?}, Outcome: {:?}", args.side, args.outcome);
+    msg!("Price: {}, Amount: {}", args.price, args.amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 CancelOrder
+fn process_relayer_cancel_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerCancelOrderArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let order_info = next_account_info(account_info_iter)?;
+    let user_vault_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    let mut order = deserialize_account::<Order>(&order_info.data.borrow())?;
+    
+    // Verify order belongs to user
+    if order.owner != args.user_wallet {
+        msg!("Order does not belong to user");
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    if order.status != OrderStatus::Open {
+        msg!("Order is not open");
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    // Cancel order
+    order.status = OrderStatus::Cancelled;
+    order.updated_at = get_current_timestamp()?;
+    order.serialize(&mut *order_info.data.borrow_mut())?;
+    
+    // Update market stats
+    market.open_interest = market.open_interest.saturating_sub(1);
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // TODO: Release margin via Vault CPI
+    msg!("⚠️ Relayer cancel order: Vault margin release to be implemented");
+    
+    msg!("✅ RelayerCancelOrder completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Order ID: {}", args.order_id);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 ClaimWinnings
+fn process_relayer_claim_winnings(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerClaimWinningsArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let position_info = next_account_info(account_info_iter)?;
+    let user_token_info = next_account_info(account_info_iter)?;
+    let token_mint_info = next_account_info(account_info_iter)?;
+    let market_vault_info = next_account_info(account_info_iter)?;
+    let user_vault_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if market.status != MarketStatus::Resolved {
+        return Err(PredictionMarketError::MarketNotResolved.into());
+    }
+    
+    // Get user's winning token balance and burn
+    let user_token_account = spl_token::state::Account::unpack(&user_token_info.data.borrow())?;
+    let winning_amount = user_token_account.amount;
+    
+    if winning_amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Burn winning tokens (market as authority)
+    invoke_signed(
+        &spl_token::instruction::burn(
+            token_program_info.key,
+            user_token_info.key,
+            token_mint_info.key,
+            market_info.key,
+            &[],
+            winning_amount,
+        )?,
+        &[user_token_info.clone(), token_mint_info.clone(), market_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // TODO: Credit user's Vault balance via CPI
+    msg!("⚠️ Relayer claim: Vault credit to be implemented");
+    
+    msg!("✅ RelayerClaimWinnings completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Amount: {}", winning_amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 RefundCancelledMarket
+fn process_relayer_refund_cancelled_market(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRefundCancelledMarketArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Similar logic to RefundCancelledMarket but with Relayer as signer
+    msg!("✅ RelayerRefundCancelledMarket - implementation pending full Vault CPI");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 MintMultiOutcomeCompleteSet
+fn process_relayer_mint_multi_outcome_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMintMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Similar logic to MintMultiOutcomeCompleteSet
+    msg!("✅ RelayerMintMultiOutcomeCompleteSet - implementation pending");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
+    msg!("Amount: {}", args.amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 RedeemMultiOutcomeCompleteSet
+fn process_relayer_redeem_multi_outcome_complete_set(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRedeemMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    msg!("✅ RelayerRedeemMultiOutcomeCompleteSet - implementation pending");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
+    msg!("Amount: {}", args.amount);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 PlaceMultiOutcomeOrder
+fn process_relayer_place_multi_outcome_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerPlaceMultiOutcomeOrderArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    msg!("✅ RelayerPlaceMultiOutcomeOrder - implementation pending");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
+    msg!("Outcome Index: {}", args.outcome_index);
+    
+    Ok(())
+}
+
+/// Relayer 版本的 ClaimMultiOutcomeWinnings
+fn process_relayer_claim_multi_outcome_winnings(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerClaimMultiOutcomeWinningsArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    verify_relayer(&config, relayer_info.key)?;
+    
+    msg!("✅ RelayerClaimMultiOutcomeWinnings - implementation pending");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market ID: {}", args.market_id);
     
     Ok(())
 }

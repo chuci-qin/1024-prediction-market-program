@@ -364,6 +364,155 @@ pub enum PredictionMarketInstruction {
     /// 0. `[signer]` Admin
     /// 1. `[writable]` PredictionMarketConfig
     RemoveAuthorizedCaller(RemoveAuthorizedCallerArgs),
+    
+    // =========================================================================
+    // Multi-Outcome Market Operations (100-119)
+    // =========================================================================
+    
+    /// Create a multi-outcome market (e.g., election with multiple candidates)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Creator
+    /// 1. `[writable]` PredictionMarketConfig
+    /// 2. `[writable]` Market PDA
+    /// 3. `[writable]` Market Vault PDA
+    /// 4. `[]` USDC Mint
+    /// 5. `[]` Token Program
+    /// 6. `[]` System Program
+    /// 7. `[]` Rent Sysvar
+    /// 8..8+n. `[writable]` Outcome Token Mints (n outcomes)
+    CreateMultiOutcomeMarket(CreateMultiOutcomeMarketArgs),
+    
+    /// Mint a complete set for multi-outcome market
+    /// (1 USDC -> 1 token of each outcome)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Market Vault
+    /// 4. `[writable]` User's USDC Account
+    /// 5. `[writable]` User Position PDA
+    /// 6. `[]` Token Program
+    /// 7. `[]` System Program
+    /// 8..8+n. `[writable]` Outcome Token Mints + User Token Accounts (pairs)
+    MintMultiOutcomeCompleteSet(MintMultiOutcomeCompleteSetArgs),
+    
+    /// Redeem a complete set for multi-outcome market
+    /// (1 of each outcome token -> 1 USDC)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Market Vault
+    /// 4. `[writable]` User's USDC Account
+    /// 5. `[writable]` User Position PDA
+    /// 6. `[]` Token Program
+    /// 7..7+n. `[writable]` Outcome Token Mints + User Token Accounts (pairs)
+    RedeemMultiOutcomeCompleteSet(RedeemMultiOutcomeCompleteSetArgs),
+    
+    /// Place an order for a specific outcome in multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA
+    /// 4. `[writable]` User Position PDA
+    /// 5. `[writable]` Outcome Token Mint
+    /// 6. `[writable]` User's Outcome Token Account (for sell orders)
+    /// 7. `[writable]` Escrow Token Account (for sell orders)
+    /// 8. `[]` Token Program
+    /// 9. `[]` System Program
+    PlaceMultiOutcomeOrder(PlaceMultiOutcomeOrderArgs),
+    
+    /// Propose result for multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Oracle Admin
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Oracle Proposal PDA
+    /// 4. `[]` System Program
+    ProposeMultiOutcomeResult(ProposeMultiOutcomeResultArgs),
+    
+    /// Claim winnings from multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market
+    /// 3. `[writable]` User Position PDA
+    /// 4. `[writable]` User's Winning Outcome Token Account
+    /// 5. `[writable]` Winning Outcome Token Mint
+    /// 6. `[writable]` Market Vault
+    /// 7. `[writable]` User's USDC Account
+    /// 8. `[]` Token Program
+    ClaimMultiOutcomeWinnings(ClaimMultiOutcomeWinningsArgs),
+    
+    // =========================================================================
+    // Relayer Instructions (200-249) - Admin/Relayer 代替用户签名
+    // =========================================================================
+    
+    /// Relayer 版本的 MintCompleteSet
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Market Vault
+    /// 4. `[writable]` User's Vault Account (Vault Program)
+    /// 5. `[writable]` YES Token Mint
+    /// 6. `[writable]` NO Token Mint
+    /// 7. `[writable]` User's YES Token Account
+    /// 8. `[writable]` User's NO Token Account
+    /// 9. `[writable]` Position PDA
+    /// 10. `[]` VaultConfig
+    /// 11. `[]` Vault Program
+    /// 12. `[]` Token Program
+    /// 13. `[]` System Program
+    RelayerMintCompleteSet(RelayerMintCompleteSetArgs),
+    
+    /// Relayer 版本的 RedeemCompleteSet
+    /// 
+    /// Accounts: (类似于 RelayerMintCompleteSet)
+    RelayerRedeemCompleteSet(RelayerRedeemCompleteSetArgs),
+    
+    /// Relayer 版本的 PlaceOrder
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA
+    /// 4. `[writable]` User Position PDA
+    /// 5. `[writable]` User Vault Account (for margin lock)
+    /// 6. `[]` Vault Config
+    /// 7. `[]` Vault Program
+    /// 8. `[]` System Program
+    RelayerPlaceOrder(RelayerPlaceOrderArgs),
+    
+    /// Relayer 版本的 CancelOrder
+    RelayerCancelOrder(RelayerCancelOrderArgs),
+    
+    /// Relayer 版本的 ClaimWinnings
+    RelayerClaimWinnings(RelayerClaimWinningsArgs),
+    
+    /// Relayer 版本的 RefundCancelledMarket
+    RelayerRefundCancelledMarket(RelayerRefundCancelledMarketArgs),
+    
+    /// Relayer 版本的 MintMultiOutcomeCompleteSet
+    RelayerMintMultiOutcomeCompleteSet(RelayerMintMultiOutcomeCompleteSetArgs),
+    
+    /// Relayer 版本的 RedeemMultiOutcomeCompleteSet
+    RelayerRedeemMultiOutcomeCompleteSet(RelayerRedeemMultiOutcomeCompleteSetArgs),
+    
+    /// Relayer 版本的 PlaceMultiOutcomeOrder
+    RelayerPlaceMultiOutcomeOrder(RelayerPlaceMultiOutcomeOrderArgs),
+    
+    /// Relayer 版本的 ClaimMultiOutcomeWinnings
+    RelayerClaimMultiOutcomeWinnings(RelayerClaimMultiOutcomeWinningsArgs),
 }
 
 // ============================================================================
@@ -588,6 +737,203 @@ pub struct AddAuthorizedCallerArgs {
 pub struct RemoveAuthorizedCallerArgs {
     /// Caller to remove
     pub caller: Pubkey,
+}
+
+// === Multi-Outcome Market Operations ===
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct CreateMultiOutcomeMarketArgs {
+    /// Question hash (SHA256 of IPFS CID or question text)
+    pub question_hash: [u8; 32],
+    /// Resolution specification hash
+    pub resolution_spec_hash: [u8; 32],
+    /// Number of outcomes (2-32)
+    pub num_outcomes: u8,
+    /// Outcome label hashes (SHA256 of each outcome label)
+    /// Length must match num_outcomes
+    pub outcome_hashes: Vec<[u8; 32]>,
+    /// Earliest resolution time (Unix timestamp)
+    pub resolution_time: i64,
+    /// Latest finalization deadline (Unix timestamp)
+    pub finalization_deadline: i64,
+    /// Creator fee in basis points (max 500 = 5%)
+    pub creator_fee_bps: u16,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MintMultiOutcomeCompleteSetArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to mint (1 USDC -> 1 of each outcome token)
+    pub amount: u64,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RedeemMultiOutcomeCompleteSetArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to redeem (1 of each outcome token -> 1 USDC)
+    pub amount: u64,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct PlaceMultiOutcomeOrderArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Order side (Buy/Sell)
+    pub side: OrderSide,
+    /// Outcome index (0-based)
+    pub outcome_index: u8,
+    /// Price (e6, e.g., 250000 = $0.25 for 4-outcome market)
+    pub price: u64,
+    /// Amount in tokens
+    pub amount: u64,
+    /// Order type
+    pub order_type: OrderType,
+    /// Expiration time (for GTD orders)
+    pub expiration_time: Option<i64>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ProposeMultiOutcomeResultArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Winning outcome index (0-based)
+    pub winning_outcome_index: u8,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ClaimMultiOutcomeWinningsArgs {
+    /// Market ID
+    pub market_id: u64,
+}
+
+// ============================================================================
+// Relayer Instructions (200-249) - User does NOT sign
+// ============================================================================
+
+/// Relayer版本的MintCompleteSet
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerMintCompleteSetArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to mint
+    pub amount: u64,
+}
+
+/// Relayer版本的RedeemCompleteSet
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerRedeemCompleteSetArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to redeem
+    pub amount: u64,
+}
+
+/// Relayer版本的PlaceOrder
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerPlaceOrderArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order side (Buy/Sell)
+    pub side: OrderSide,
+    /// Outcome (YES/NO)
+    pub outcome: Outcome,
+    /// Price (e6)
+    pub price: u64,
+    /// Amount in tokens
+    pub amount: u64,
+    /// Order type
+    pub order_type: OrderType,
+    /// Expiration time (for GTD orders)
+    pub expiration_time: Option<i64>,
+}
+
+/// Relayer版本的CancelOrder
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerCancelOrderArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order ID
+    pub order_id: u64,
+}
+
+/// Relayer版本的ClaimWinnings
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerClaimWinningsArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+}
+
+/// Relayer版本的RefundCancelledMarket
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerRefundCancelledMarketArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+}
+
+/// Relayer版本的MintMultiOutcomeCompleteSet
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerMintMultiOutcomeCompleteSetArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to mint
+    pub amount: u64,
+}
+
+/// Relayer版本的RedeemMultiOutcomeCompleteSet
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerRedeemMultiOutcomeCompleteSetArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Amount to redeem
+    pub amount: u64,
+}
+
+/// Relayer版本的PlaceMultiOutcomeOrder
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerPlaceMultiOutcomeOrderArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order side (Buy/Sell)
+    pub side: OrderSide,
+    /// Outcome index (0-based)
+    pub outcome_index: u8,
+    /// Price (e6)
+    pub price: u64,
+    /// Amount in tokens
+    pub amount: u64,
+    /// Order type
+    pub order_type: OrderType,
+    /// Expiration time (for GTD orders)
+    pub expiration_time: Option<i64>,
+}
+
+/// Relayer版本的ClaimMultiOutcomeWinnings
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerClaimMultiOutcomeWinningsArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
 }
 
 // ============================================================================

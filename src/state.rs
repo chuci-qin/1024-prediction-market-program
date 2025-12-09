@@ -28,10 +28,14 @@ pub const MARKET_VAULT_SEED: &[u8] = b"market_vault";
 pub const YES_MINT_SEED: &[u8] = b"yes_mint";
 pub const NO_MINT_SEED: &[u8] = b"no_mint";
 pub const ORACLE_PROPOSAL_SEED: &[u8] = b"oracle_proposal";
+pub const OUTCOME_MINT_SEED: &[u8] = b"outcome_mint"; // For multi-outcome markets
 
 // ============================================================================
 // Constants
 // ============================================================================
+
+/// Maximum number of outcomes for multi-outcome markets
+pub const MAX_OUTCOMES: usize = 32;
 
 /// Maximum length of market question (bytes)
 pub const MAX_QUESTION_LEN: usize = 256;
@@ -57,6 +61,21 @@ pub const DEFAULT_PROPOSER_BOND: u64 = 100_000_000;
 // ============================================================================
 // Enums
 // ============================================================================
+
+/// Market type (binary or multi-outcome)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketType {
+    /// Binary market (YES/NO)
+    Binary = 0,
+    /// Multi-outcome market (e.g., election with multiple candidates)
+    MultiOutcome = 1,
+}
+
+impl Default for MarketType {
+    fn default() -> Self {
+        MarketType::Binary
+    }
+}
 
 /// Market lifecycle status
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,8 +255,10 @@ pub struct PredictionMarketConfig {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use
-    pub reserved: [u8; 64],
+    /// Reserved for future use (split for Borsh compatibility)
+    pub reserved1: [u8; 32],
+    pub reserved2: [u8; 32],
+    pub reserved3: [u8; 8],
 }
 
 impl PredictionMarketConfig {
@@ -256,7 +277,9 @@ impl PredictionMarketConfig {
         + 8   // proposer_bond_e6
         + 1   // is_paused
         + 1   // bump
-        + 64; // reserved
+        + 32  // reserved1
+        + 32  // reserved2
+        + 8;  // reserved3 (= 290 total)
     
     /// PDA seeds
     pub fn seeds() -> Vec<Vec<u8>> {
@@ -288,7 +311,9 @@ impl PredictionMarketConfig {
             proposer_bond_e6: DEFAULT_PROPOSER_BOND,
             is_paused: false,
             bump,
-            reserved: [0u8; 64],
+            reserved1: [0u8; 32],
+            reserved2: [0u8; 32],
+            reserved3: [0u8; 8],
         }
     }
 }
@@ -304,6 +329,12 @@ pub struct Market {
     /// Unique market ID
     pub market_id: u64,
     
+    /// Market type (Binary or MultiOutcome)
+    pub market_type: MarketType,
+    
+    /// Number of outcomes (2 for binary, up to MAX_OUTCOMES for multi)
+    pub num_outcomes: u8,
+    
     /// Market creator
     pub creator: Pubkey,
     
@@ -313,10 +344,10 @@ pub struct Market {
     /// Resolution specification hash
     pub resolution_spec_hash: [u8; 32],
     
-    /// YES Token Mint
+    /// YES Token Mint (for binary markets)
     pub yes_mint: Pubkey,
     
-    /// NO Token Mint
+    /// NO Token Mint (for binary markets)
     pub no_mint: Pubkey,
     
     /// Market USDC Vault
@@ -334,8 +365,11 @@ pub struct Market {
     /// Latest finalization deadline (Unix timestamp)
     pub finalization_deadline: i64,
     
-    /// Final result (set after resolution)
+    /// Final result (set after resolution) - for binary markets
     pub final_result: Option<MarketResult>,
+    
+    /// Winning outcome index (for multi-outcome markets)
+    pub winning_outcome_index: Option<u8>,
     
     /// Market creation timestamp
     pub created_at: i64,
@@ -362,12 +396,14 @@ pub struct Market {
     pub bump: u8,
     
     /// Reserved for future use
-    pub reserved: [u8; 64],
+    pub reserved: [u8; 60],
 }
 
 impl Market {
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
+        + 1   // market_type
+        + 1   // num_outcomes
         + 32  // creator
         + 32  // question_hash
         + 32  // resolution_spec_hash
@@ -379,6 +415,7 @@ impl Market {
         + 8   // resolution_time
         + 8   // finalization_deadline
         + 1 + 1 // final_result (Option<MarketResult>)
+        + 1 + 1 // winning_outcome_index (Option<u8>)
         + 8   // created_at
         + 8   // updated_at
         + 8   // total_minted
@@ -387,7 +424,7 @@ impl Market {
         + 2   // creator_fee_bps
         + 8   // next_order_id
         + 1   // bump
-        + 64; // reserved
+        + 60; // reserved (reduced by 4)
     
     /// PDA seeds
     pub fn seeds(market_id: u64) -> Vec<Vec<u8>> {
@@ -409,7 +446,191 @@ impl Market {
     
     /// Check if market is resolved with a result
     pub fn is_resolved(&self) -> bool {
-        self.status == MarketStatus::Resolved && self.final_result.is_some()
+        match self.market_type {
+            MarketType::Binary => self.status == MarketStatus::Resolved && self.final_result.is_some(),
+            MarketType::MultiOutcome => self.status == MarketStatus::Resolved && self.winning_outcome_index.is_some(),
+        }
+    }
+    
+    /// Check if this is a binary market
+    pub fn is_binary(&self) -> bool {
+        self.market_type == MarketType::Binary
+    }
+    
+    /// Check if this is a multi-outcome market
+    pub fn is_multi_outcome(&self) -> bool {
+        self.market_type == MarketType::MultiOutcome
+    }
+}
+
+// ============================================================================
+// Multi-Outcome Market Support
+// ============================================================================
+
+/// Outcome metadata for multi-outcome markets
+/// 
+/// Stored off-chain (IPFS), with only the hash stored on-chain.
+/// Each outcome has a separate token mint derived from:
+/// PDA Seeds: ["outcome_mint", market_id.to_le_bytes(), outcome_index]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct OutcomeMetadata {
+    /// Outcome index (0-based)
+    pub index: u8,
+    /// Label hash (SHA256 of outcome label)
+    pub label_hash: [u8; 32],
+    /// Token mint address
+    pub mint: Pubkey,
+}
+
+impl OutcomeMetadata {
+    pub const SIZE: usize = 1 + 32 + 32; // index + label_hash + mint
+    
+    /// Derive outcome mint PDA seeds
+    pub fn mint_seeds(market_id: u64, outcome_index: u8) -> Vec<Vec<u8>> {
+        vec![
+            OUTCOME_MINT_SEED.to_vec(),
+            market_id.to_le_bytes().to_vec(),
+            vec![outcome_index],
+        ]
+    }
+}
+
+/// Multi-outcome position
+/// 
+/// Tracks a user's holdings across all outcomes in a multi-outcome market.
+/// Uses a fixed-size array for up to MAX_OUTCOMES outcomes.
+/// 
+/// PDA Seeds: ["position", market_id.to_le_bytes(), owner.key()]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MultiOutcomePosition {
+    /// Account discriminator
+    pub discriminator: u64,
+    
+    /// Market ID
+    pub market_id: u64,
+    
+    /// Number of outcomes
+    pub num_outcomes: u8,
+    
+    /// Position owner
+    pub owner: Pubkey,
+    
+    /// Holdings for each outcome (up to MAX_OUTCOMES)
+    /// Each element is the token amount for that outcome index
+    pub holdings: [u64; MAX_OUTCOMES],
+    
+    /// Average cost for each outcome (e6)
+    pub avg_costs: [u64; MAX_OUTCOMES],
+    
+    /// Realized PnL (e6, can be negative)
+    pub realized_pnl: i64,
+    
+    /// Total USDC spent
+    pub total_cost_e6: u64,
+    
+    /// Has this position been settled?
+    pub settled: bool,
+    
+    /// Settlement amount received (e6)
+    pub settlement_amount: u64,
+    
+    /// Creation timestamp
+    pub created_at: i64,
+    
+    /// Last update timestamp
+    pub updated_at: i64,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// Reserved for future use
+    pub reserved: [u8; 32],
+}
+
+impl MultiOutcomePosition {
+    // holdings: 32 * 8 = 256 bytes, avg_costs: 32 * 8 = 256 bytes
+    pub const SIZE: usize = 8   // discriminator
+        + 8   // market_id
+        + 1   // num_outcomes
+        + 32  // owner
+        + (MAX_OUTCOMES * 8)  // holdings
+        + (MAX_OUTCOMES * 8)  // avg_costs
+        + 8   // realized_pnl
+        + 8   // total_cost_e6
+        + 1   // settled
+        + 8   // settlement_amount
+        + 8   // created_at
+        + 8   // updated_at
+        + 1   // bump
+        + 32; // reserved
+    
+    /// Create a new empty multi-outcome position
+    pub fn new(market_id: u64, num_outcomes: u8, owner: Pubkey, bump: u8, created_at: i64) -> Self {
+        Self {
+            discriminator: POSITION_DISCRIMINATOR,
+            market_id,
+            num_outcomes,
+            owner,
+            holdings: [0u64; MAX_OUTCOMES],
+            avg_costs: [0u64; MAX_OUTCOMES],
+            realized_pnl: 0,
+            total_cost_e6: 0,
+            settled: false,
+            settlement_amount: 0,
+            created_at,
+            updated_at: created_at,
+            bump,
+            reserved: [0u8; 32],
+        }
+    }
+    
+    /// Check if position is empty (no tokens in any outcome)
+    pub fn is_empty(&self) -> bool {
+        for i in 0..self.num_outcomes as usize {
+            if self.holdings[i] > 0 {
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// Get holdings for a specific outcome
+    pub fn get_holding(&self, outcome_index: u8) -> u64 {
+        if (outcome_index as usize) < MAX_OUTCOMES {
+            self.holdings[outcome_index as usize]
+        } else {
+            0
+        }
+    }
+    
+    /// Add tokens for a specific outcome
+    pub fn add_tokens(&mut self, outcome_index: u8, amount: u64, price: u64, current_time: i64) {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return;
+        }
+        
+        // Update weighted average cost
+        let total_prev = self.holdings[idx] * self.avg_costs[idx];
+        let total_new = amount * price;
+        let new_total_amount = self.holdings[idx] + amount;
+        if new_total_amount > 0 {
+            self.avg_costs[idx] = (total_prev + total_new) / new_total_amount;
+        }
+        self.holdings[idx] += amount;
+        
+        let cost = ((amount as u128) * (price as u128) / (PRICE_PRECISION as u128)) as u64;
+        self.total_cost_e6 += cost;
+        self.updated_at = current_time;
+    }
+    
+    /// Calculate settlement value based on winning outcome
+    pub fn calculate_settlement(&self, winning_index: u8) -> u64 {
+        if (winning_index as usize) < MAX_OUTCOMES {
+            self.holdings[winning_index as usize]
+        } else {
+            0
+        }
     }
 }
 

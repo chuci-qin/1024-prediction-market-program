@@ -15,7 +15,7 @@ const {
 } = require('@solana/web3.js');
 const fs = require('fs');
 
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
 
 // Seeds
 const PM_CONFIG_SEED = Buffer.from('pm_config');

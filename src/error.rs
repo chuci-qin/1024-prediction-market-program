@@ -54,6 +54,9 @@ pub enum PredictionMarketError {
     #[error("Invalid USDC mint")]
     InvalidUSDCMint = 13,
     
+    #[error("Invalid argument")]
+    InvalidArgument = 14,
+    
     // === Market Errors (100-199) ===
     
     #[error("Market not found")]
