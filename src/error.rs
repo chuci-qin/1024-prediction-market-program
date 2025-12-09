@@ -21,8 +21,8 @@ pub enum PredictionMarketError {
     #[error("Account not initialized")]
     AccountNotInitialized = 2,
     
-    #[error("Account already initialized")]
-    AccountAlreadyInitialized = 3,
+    #[error("Already initialized")]
+    AlreadyInitialized = 3,
     
     #[error("Invalid program address")]
     InvalidProgramAddress = 4,
@@ -41,6 +41,18 @@ pub enum PredictionMarketError {
     
     #[error("Program is paused")]
     ProgramPaused = 9,
+    
+    #[error("Invalid PDA")]
+    InvalidPDA = 10,
+    
+    #[error("Invalid amount")]
+    InvalidAmount = 11,
+    
+    #[error("Invalid price")]
+    InvalidPrice = 12,
+    
+    #[error("Invalid USDC mint")]
+    InvalidUSDCMint = 13,
     
     // === Market Errors (100-199) ===
     
@@ -77,6 +89,33 @@ pub enum PredictionMarketError {
     #[error("Market under review")]
     MarketUnderReview = 110,
     
+    #[error("Market not tradeable")]
+    MarketNotTradeable = 111,
+    
+    #[error("Invalid finalization deadline")]
+    InvalidFinalizationDeadline = 112,
+    
+    #[error("Creator fee too high")]
+    CreatorFeeTooHigh = 113,
+    
+    #[error("Market not cancelled")]
+    MarketNotCancelled = 114,
+    
+    #[error("Market not resolvable")]
+    MarketNotResolvable = 115,
+    
+    #[error("Invalid market vault")]
+    InvalidMarketVault = 116,
+    
+    #[error("Invalid YES mint")]
+    InvalidYesMint = 117,
+    
+    #[error("Invalid NO mint")]
+    InvalidNoMint = 118,
+    
+    #[error("Invalid token mint")]
+    InvalidTokenMint = 119,
+    
     // === Order Errors (200-299) ===
     
     #[error("Order not found")]
@@ -106,19 +145,58 @@ pub enum PredictionMarketError {
     #[error("Order owner mismatch")]
     OrderOwnerMismatch = 208,
     
+    #[error("Order not active")]
+    OrderNotActive = 209,
+    
+    #[error("Invalid order side")]
+    InvalidOrderSide = 210,
+    
+    #[error("Invalid outcome")]
+    InvalidOutcome = 211,
+    
+    #[error("Invalid price pair")]
+    InvalidPricePair = 212,
+    
+    #[error("Price exceeds limit")]
+    PriceExceedsLimit = 213,
+    
+    #[error("No matchable amount")]
+    NoMatchableAmount = 214,
+    
+    #[error("Price below limit")]
+    PriceBelowLimit = 215,
+    
+    #[error("Outcome mismatch")]
+    OutcomeMismatch = 216,
+    
+    #[error("Price mismatch")]
+    PriceMismatch = 217,
+    
+    #[error("Invalid execution price")]
+    InvalidExecutionPrice = 218,
+    
+    #[error("Invalid expiration time")]
+    InvalidExpirationTime = 219,
+    
+    #[error("Missing expiration time")]
+    MissingExpirationTime = 220,
+    
     // === Position Errors (300-399) ===
     
     #[error("Position not found")]
     PositionNotFound = 300,
     
-    #[error("Position already settled")]
-    PositionAlreadySettled = 301,
+    #[error("Already settled")]
+    AlreadySettled = 301,
     
     #[error("Insufficient position")]
     InsufficientPosition = 302,
     
     #[error("Position not empty")]
     PositionNotEmpty = 303,
+    
+    #[error("Insufficient token balance")]
+    InsufficientTokenBalance = 304,
     
     // === Complete Set Errors (400-499) ===
     
@@ -157,10 +235,24 @@ pub enum PredictionMarketError {
     #[error("Insufficient proposer bond")]
     InsufficientProposerBond = 506,
     
+    #[error("Proposal already exists")]
+    ProposalAlreadyExists = 507,
+    
+    #[error("Cannot challenge")]
+    CannotChallenge = 508,
+    
+    #[error("Same result as proposal")]
+    SameResultAsProposal = 509,
+    
+    #[error("Cannot finalize")]
+    CannotFinalize = 510,
+    
+    #[error("Proposal not disputed")]
+    ProposalNotDisputed = 511,
+    
     // === Token Errors (600-699) ===
     
-    #[error("Invalid token mint")]
-    InvalidTokenMint = 600,
+    // InvalidTokenMint moved to 119 in Market Errors section
     
     #[error("Invalid token account")]
     InvalidTokenAccount = 601,

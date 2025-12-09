@@ -1,0 +1,17 @@
+{
+  "name": "prediction-market-tests",
+  "version": "1.0.0",
+  "description": "Tests for 1024 Prediction Market Program",
+  "scripts": {
+    "test:init": "ts-node test_initialize.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.87.0",
+    "borsh": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}

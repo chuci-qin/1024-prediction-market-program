@@ -30,6 +30,6 @@ pub use error::PredictionMarketError;
 pub use instruction::PredictionMarketInstruction;
 pub use state::*;
 
-// Program ID - will be updated after deployment
-solana_program::declare_id!("PMkt1111111111111111111111111111111111111111");
+// Program ID
+solana_program::declare_id!("FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58");
 

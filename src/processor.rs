@@ -7,6 +7,7 @@ use solana_program::{
     msg,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
+    program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
     system_instruction,
@@ -18,7 +19,7 @@ use crate::instruction::PredictionMarketInstruction;
 use crate::state::{
     PredictionMarketConfig, Market, Order, Position, OracleProposal,
     MarketStatus, MarketResult, ReviewStatus, OrderStatus, ProposalStatus,
-    PM_CONFIG_SEED, MARKET_SEED, ORDER_SEED, POSITION_SEED, 
+    PM_CONFIG_SEED, MARKET_SEED, ORDER_SEED, ORDER_ESCROW_SEED, POSITION_SEED, 
     MARKET_VAULT_SEED, YES_MINT_SEED, NO_MINT_SEED, ORACLE_PROPOSAL_SEED,
     PM_CONFIG_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORDER_DISCRIMINATOR, 
     POSITION_DISCRIMINATOR, ORACLE_PROPOSAL_DISCRIMINATOR,
@@ -28,6 +29,7 @@ use crate::utils::{
     check_signer, verify_pda, get_current_timestamp, create_pda_account,
     safe_add_i64, safe_sub_i64, safe_mul_u64, safe_div_u64,
     calculate_fee, validate_price, validate_price_pair,
+    deserialize_account,
 };
 
 /// Process an instruction
@@ -302,7 +304,7 @@ fn process_create_market(
     let rent_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         msg!("Error: Invalid PredictionMarketConfig discriminator");
         return Err(PredictionMarketError::InvalidAccountData.into());
@@ -549,7 +551,9 @@ fn process_activate_market(
     let market_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config_data = config_info.data.borrow();
+    let mut config = PredictionMarketConfig::deserialize(&mut &config_data[..])?;
+    drop(config_data);
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -571,7 +575,9 @@ fn process_activate_market(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let market_data = market_info.data.borrow();
+    let mut market = Market::deserialize(&mut &market_data[..])?;
+    drop(market_data);
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -611,7 +617,7 @@ fn process_pause_market(
     let market_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -633,7 +639,7 @@ fn process_pause_market(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -673,7 +679,7 @@ fn process_resume_market(
     let market_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -694,7 +700,7 @@ fn process_resume_market(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -734,7 +740,7 @@ fn process_cancel_market(
     let market_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -755,7 +761,7 @@ fn process_cancel_market(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -771,7 +777,13 @@ fn process_cancel_market(
     // Cancel market
     let current_time = get_current_timestamp()?;
     market.status = MarketStatus::Cancelled;
-    market.review_status = args.reason;
+    // Convert reason u8 to ReviewStatus
+    market.review_status = match args.reason {
+        1 => ReviewStatus::Flagged,
+        2 => ReviewStatus::CancelledInvalid,
+        3 => ReviewStatus::CancelledRegulatory,
+        _ => ReviewStatus::None,
+    };
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
@@ -781,7 +793,7 @@ fn process_cancel_market(
         config.serialize(&mut *config_info.data.borrow_mut())?;
     }
     
-    msg!("Market {} cancelled successfully. Reason: {:?}", args.market_id, args.reason);
+    msg!("Market {} cancelled successfully. Reason: {}", args.market_id, args.reason);
     
     Ok(())
 }
@@ -800,7 +812,7 @@ fn process_flag_market(
     let market_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -821,7 +833,7 @@ fn process_flag_market(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -882,7 +894,7 @@ fn process_mint_complete_set(
     let system_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -892,7 +904,7 @@ fn process_mint_complete_set(
     }
     
     // Load and validate market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -978,13 +990,18 @@ fn process_mint_complete_set(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
+    msg!("DEBUG: Position PDA verified, is_empty={}", position_info.data_is_empty());
+    
     if position_info.data_is_empty() {
-        // Create new position
+        // Create new position using create_pda_account helper
         let rent = Rent::get()?;
         let space = Position::SIZE;
         let lamports = rent.minimum_balance(space);
         let position_seeds: &[&[u8]] = &[POSITION_SEED, &market_id_bytes, user_info.key.as_ref(), &[position_bump]];
         
+        msg!("Creating position account, space={}", space);
+        
+        // Use invoke_signed to create account  
         invoke_signed(
             &system_instruction::create_account(
                 user_info.key,
@@ -997,19 +1014,39 @@ fn process_mint_complete_set(
             &[position_seeds],
         )?;
         
+        // After CPI, the position_info.data should be updated
+        // But we need to use try_borrow_mut to access the newly allocated data
+        msg!("Position account created, data len after CPI = {}", position_info.data_len());
+        
+        // Initialize position data
         let position = Position::new(market.market_id, *user_info.key, position_bump, current_time);
-        position.serialize(&mut *position_info.data.borrow_mut())?;
+        
+        // Serialize using the data_len() which should reflect the new size
+        let mut data = position_info.try_borrow_mut_data()?;
+        position.serialize(&mut data.as_mut())?;
+        drop(data);
+        
+        msg!("Position initialized successfully");
     }
     
-    // Update position
-    let mut position = Position::try_from_slice(&position_info.data.borrow())?;
+    // Update position - use try_borrow_data to ensure we get the latest data
+    let position_data = position_info.try_borrow_data()?;
+    let mut position = Position::deserialize(&mut &position_data[..])?;
+    drop(position_data);
+    
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
     
     // For complete set, cost is at $0.50 each (1 USDC total for YES + NO)
     let half_price = PRICE_PRECISION / 2; // 500_000
     position.add_tokens(crate::state::Outcome::Yes, args.amount, half_price, current_time);
     position.add_tokens(crate::state::Outcome::No, args.amount, half_price, current_time);
     
-    position.serialize(&mut *position_info.data.borrow_mut())?;
+    // Serialize position back to account
+    let mut position_data = position_info.try_borrow_mut_data()?;
+    position.serialize(&mut position_data.as_mut())?;
+    drop(position_data);
     
     // Update market stats
     market.total_minted += args.amount;
@@ -1070,7 +1107,7 @@ fn process_redeem_complete_set(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1080,7 +1117,7 @@ fn process_redeem_complete_set(
     }
     
     // Load and validate market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1118,7 +1155,7 @@ fn process_redeem_complete_set(
     }
     
     // Load position
-    let mut position = Position::try_from_slice(&position_info.data.borrow())?;
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
     if position.discriminator != POSITION_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1216,8 +1253,17 @@ fn process_place_order(
     // Account 4: System Program
     let system_program_info = next_account_info(account_info_iter)?;
     
+    // Additional accounts for Sell orders (optional):
+    // Account 5: Token Mint (YES or NO based on outcome)
+    // Account 6: User's Token Account (for the token being sold)
+    // Account 7: Escrow Token Account (writable, PDA)
+    // Account 8: Token Program
+    // Account 9: Rent Sysvar
+    
+    let is_sell_order = args.side == crate::state::OrderSide::Sell;
+    
     // Load and validate config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1237,7 +1283,7 @@ fn process_place_order(
     }
     
     // Load and validate market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1248,10 +1294,7 @@ fn process_place_order(
     }
     
     // Validate order parameters
-    if !validate_price(args.price) {
-        msg!("Error: Price must be between 0.01 and 0.99");
-        return Err(PredictionMarketError::InvalidPrice.into());
-    }
+    validate_price(args.price)?;
     
     if args.amount == 0 {
         return Err(PredictionMarketError::InvalidAmount.into());
@@ -1303,6 +1346,84 @@ fn process_place_order(
         &[order_seeds],
     )?;
     
+    // For sell orders, create escrow and lock tokens
+    let escrow_token_account: Option<Pubkey> = if is_sell_order {
+        // Get additional accounts for sell order
+        let token_mint_info = next_account_info(account_info_iter)?;
+        let user_token_info = next_account_info(account_info_iter)?;
+        let escrow_token_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        let rent_sysvar_info = next_account_info(account_info_iter)?;
+        
+        // Verify token mint matches the outcome
+        let expected_mint = match args.outcome {
+            crate::state::Outcome::Yes => market.yes_mint,
+            crate::state::Outcome::No => market.no_mint,
+        };
+        if *token_mint_info.key != expected_mint {
+            msg!("Error: Token mint does not match outcome");
+            return Err(PredictionMarketError::InvalidTokenMint.into());
+        }
+        
+        // Derive escrow PDA
+        let (escrow_pda, escrow_bump) = Pubkey::find_program_address(
+            &[ORDER_ESCROW_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *escrow_token_info.key != escrow_pda {
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Create escrow token account (owned by order PDA)
+        let escrow_seeds: &[&[u8]] = &[ORDER_ESCROW_SEED, &market_id_bytes, &order_id_bytes, &[escrow_bump]];
+        
+        let rent = Rent::from_account_info(rent_sysvar_info)?;
+        let space = spl_token::state::Account::LEN;
+        let lamports = rent.minimum_balance(space);
+        
+        // Create the escrow account
+        invoke_signed(
+            &system_instruction::create_account(
+                user_info.key,
+                escrow_token_info.key,
+                lamports,
+                space as u64,
+                &spl_token::id(),
+            ),
+            &[user_info.clone(), escrow_token_info.clone(), system_program_info.clone()],
+            &[escrow_seeds],
+        )?;
+        
+        // Initialize the escrow token account with order PDA as owner
+        invoke(
+            &spl_token::instruction::initialize_account3(
+                token_program_info.key,
+                escrow_token_info.key,
+                token_mint_info.key,
+                order_info.key, // Order PDA is the owner
+            )?,
+            &[escrow_token_info.clone(), token_mint_info.clone()],
+        )?;
+        
+        // Transfer tokens from user to escrow
+        invoke(
+            &spl_token::instruction::transfer(
+                token_program_info.key,
+                user_token_info.key,
+                escrow_token_info.key,
+                user_info.key,
+                &[],
+                args.amount,
+            )?,
+            &[user_token_info.clone(), escrow_token_info.clone(), user_info.clone(), token_program_info.clone()],
+        )?;
+        
+        msg!("Tokens locked in escrow: {}", args.amount);
+        Some(escrow_pda)
+    } else {
+        None
+    };
+    
     // Initialize order
     let order = Order {
         discriminator: ORDER_DISCRIMINATOR,
@@ -1320,7 +1441,8 @@ fn process_place_order(
         created_at: current_time,
         updated_at: current_time,
         bump: order_bump,
-        reserved: [0u8; 32],
+        escrow_token_account,
+        reserved: [0u8; 31],
     };
     
     order.serialize(&mut *order_info.data.borrow_mut())?;
@@ -1368,7 +1490,7 @@ fn process_cancel_order(
     
     // Verify Order PDA
     let order_id_bytes = args.order_id.to_le_bytes();
-    let (order_pda, _) = Pubkey::find_program_address(
+    let (order_pda, order_bump) = Pubkey::find_program_address(
         &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
         program_id,
     );
@@ -1377,7 +1499,7 @@ fn process_cancel_order(
     }
     
     // Load order
-    let mut order = Order::try_from_slice(&order_info.data.borrow())?;
+    let mut order = deserialize_account::<Order>(&order_info.data.borrow())?;
     if order.discriminator != ORDER_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1395,6 +1517,62 @@ fn process_cancel_order(
     }
     
     let current_time = get_current_timestamp()?;
+    let remaining_amount = order.remaining_amount();
+    
+    // If sell order with escrow, return tokens to user
+    if order.has_escrow() {
+        // Additional accounts for returning escrowed tokens:
+        // Account 3: User's Token Account (writable)
+        // Account 4: Escrow Token Account (writable)
+        // Account 5: Token Program
+        let user_token_info = next_account_info(account_info_iter)?;
+        let escrow_token_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        
+        // Verify escrow PDA
+        let (escrow_pda, _) = Pubkey::find_program_address(
+            &[ORDER_ESCROW_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *escrow_token_info.key != escrow_pda {
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Transfer remaining tokens back to user (using order PDA as signer)
+        let order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &order_id_bytes, &[order_bump]];
+        
+        if remaining_amount > 0 {
+            invoke_signed(
+                &spl_token::instruction::transfer(
+                    token_program_info.key,
+                    escrow_token_info.key,
+                    user_token_info.key,
+                    order_info.key, // Order PDA is the owner
+                    &[],
+                    remaining_amount,
+                )?,
+                &[escrow_token_info.clone(), user_token_info.clone(), order_info.clone(), token_program_info.clone()],
+                &[order_seeds],
+            )?;
+            
+            msg!("Returned {} tokens from escrow", remaining_amount);
+        }
+        
+        // Close escrow account and return lamports to user
+        invoke_signed(
+            &spl_token::instruction::close_account(
+                token_program_info.key,
+                escrow_token_info.key,
+                user_info.key,
+                order_info.key,
+                &[],
+            )?,
+            &[escrow_token_info.clone(), user_info.clone(), order_info.clone(), token_program_info.clone()],
+            &[order_seeds],
+        )?;
+        
+        msg!("Closed escrow token account");
+    }
     
     // Cancel order
     order.status = OrderStatus::Cancelled;
@@ -1404,7 +1582,7 @@ fn process_cancel_order(
     msg!("Order cancelled successfully");
     msg!("Order ID: {}", args.order_id);
     msg!("Market ID: {}", args.market_id);
-    msg!("Unfilled amount: {}", order.remaining_amount());
+    msg!("Returned amount: {}", remaining_amount);
     
     Ok(())
 }
@@ -1448,7 +1626,7 @@ fn process_match_mint(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1468,7 +1646,7 @@ fn process_match_mint(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1505,8 +1683,8 @@ fn process_match_mint(
     }
     
     // Load orders
-    let mut yes_order = Order::try_from_slice(&yes_order_info.data.borrow())?;
-    let mut no_order = Order::try_from_slice(&no_order_info.data.borrow())?;
+    let mut yes_order = deserialize_account::<Order>(&yes_order_info.data.borrow())?;
+    let mut no_order = deserialize_account::<Order>(&no_order_info.data.borrow())?;
     
     // Validate orders
     if yes_order.discriminator != ORDER_DISCRIMINATOR || no_order.discriminator != ORDER_DISCRIMINATOR {
@@ -1535,10 +1713,7 @@ fn process_match_mint(
     }
     
     // Validate prices are complementary (should sum to >= 1.0)
-    if !validate_price_pair(args.yes_price, args.no_price) {
-        msg!("Error: YES price + NO price must equal 1.0 for minting");
-        return Err(PredictionMarketError::InvalidPricePair.into());
-    }
+    validate_price_pair(args.yes_price, args.no_price)?;
     
     // Verify prices match or are better than limit prices
     if args.yes_price > yes_order.price {
@@ -1683,7 +1858,7 @@ fn process_match_burn(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1703,7 +1878,7 @@ fn process_match_burn(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1725,7 +1900,7 @@ fn process_match_burn(
     
     // Verify Order PDAs
     let yes_order_id_bytes = args.yes_order_id.to_le_bytes();
-    let (yes_order_pda, _) = Pubkey::find_program_address(
+    let (yes_order_pda, yes_order_bump) = Pubkey::find_program_address(
         &[ORDER_SEED, &market_id_bytes, &yes_order_id_bytes],
         program_id,
     );
@@ -1734,7 +1909,7 @@ fn process_match_burn(
     }
     
     let no_order_id_bytes = args.no_order_id.to_le_bytes();
-    let (no_order_pda, _) = Pubkey::find_program_address(
+    let (no_order_pda, no_order_bump) = Pubkey::find_program_address(
         &[ORDER_SEED, &market_id_bytes, &no_order_id_bytes],
         program_id,
     );
@@ -1743,8 +1918,8 @@ fn process_match_burn(
     }
     
     // Load orders
-    let mut yes_order = Order::try_from_slice(&yes_order_info.data.borrow())?;
-    let mut no_order = Order::try_from_slice(&no_order_info.data.borrow())?;
+    let mut yes_order = deserialize_account::<Order>(&yes_order_info.data.borrow())?;
+    let mut no_order = deserialize_account::<Order>(&no_order_info.data.borrow())?;
     
     // Validate orders
     if yes_order.discriminator != ORDER_DISCRIMINATOR || no_order.discriminator != ORDER_DISCRIMINATOR {
@@ -1798,36 +1973,44 @@ fn process_match_burn(
     
     let current_time = get_current_timestamp()?;
     
-    // Calculate market PDA seeds for signing
-    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    // Verify orders have escrow (sell orders should have escrowed tokens)
+    if !yes_order.has_escrow() || !no_order.has_escrow() {
+        msg!("Error: Sell orders must have escrowed tokens for MatchBurn");
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
     
-    // Burn YES tokens from YES seller (requires seller signature - simplified here)
-    // Note: In production, tokens should be transferred to escrow first when order is placed
+    // Calculate PDA seeds for signing
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    let yes_order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &yes_order_id_bytes, &[yes_order_bump]];
+    let no_order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &no_order_id_bytes, &[no_order_bump]];
+    
+    // Burn YES tokens from YES seller's escrow (using order PDA as signer)
+    // yes_seller_token_info is now the escrow token account
     invoke_signed(
         &spl_token::instruction::burn(
             token_program_info.key,
             yes_seller_token_info.key,
             yes_mint_info.key,
-            market_info.key, // We assume tokens were escrowed to market
+            yes_order_info.key, // Order PDA is the owner of escrow
             &[],
             match_amount,
         )?,
-        &[yes_seller_token_info.clone(), yes_mint_info.clone(), market_info.clone(), token_program_info.clone()],
-        &[market_seeds],
+        &[yes_seller_token_info.clone(), yes_mint_info.clone(), yes_order_info.clone(), token_program_info.clone()],
+        &[yes_order_seeds],
     )?;
     
-    // Burn NO tokens from NO seller
+    // Burn NO tokens from NO seller's escrow
     invoke_signed(
         &spl_token::instruction::burn(
             token_program_info.key,
             no_seller_token_info.key,
             no_mint_info.key,
-            market_info.key,
+            no_order_info.key, // Order PDA is the owner of escrow
             &[],
             match_amount,
         )?,
-        &[no_seller_token_info.clone(), no_mint_info.clone(), market_info.clone(), token_program_info.clone()],
-        &[market_seeds],
+        &[no_seller_token_info.clone(), no_mint_info.clone(), no_order_info.clone(), token_program_info.clone()],
+        &[no_order_seeds],
     )?;
     
     // Calculate proceeds for each seller
@@ -1932,7 +2115,7 @@ fn process_execute_trade(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1952,7 +2135,7 @@ fn process_execute_trade(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -1961,19 +2144,19 @@ fn process_execute_trade(
         return Err(PredictionMarketError::MarketNotTradeable.into());
     }
     
-    // Verify Order PDAs
-    let buy_order_id_bytes = args.buy_order_id.to_le_bytes();
+    // Verify Order PDAs (taker = buy, maker = sell in this context)
+    let taker_order_id_bytes = args.taker_order_id.to_le_bytes();
     let (buy_order_pda, _) = Pubkey::find_program_address(
-        &[ORDER_SEED, &market_id_bytes, &buy_order_id_bytes],
+        &[ORDER_SEED, &market_id_bytes, &taker_order_id_bytes],
         program_id,
     );
     if *buy_order_info.key != buy_order_pda {
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    let sell_order_id_bytes = args.sell_order_id.to_le_bytes();
+    let maker_order_id_bytes = args.maker_order_id.to_le_bytes();
     let (sell_order_pda, _) = Pubkey::find_program_address(
-        &[ORDER_SEED, &market_id_bytes, &sell_order_id_bytes],
+        &[ORDER_SEED, &market_id_bytes, &maker_order_id_bytes],
         program_id,
     );
     if *sell_order_info.key != sell_order_pda {
@@ -1981,8 +2164,8 @@ fn process_execute_trade(
     }
     
     // Load orders
-    let mut buy_order = Order::try_from_slice(&buy_order_info.data.borrow())?;
-    let mut sell_order = Order::try_from_slice(&sell_order_info.data.borrow())?;
+    let mut buy_order = deserialize_account::<Order>(&buy_order_info.data.borrow())?;
+    let mut sell_order = deserialize_account::<Order>(&sell_order_info.data.borrow())?;
     
     // Validate orders
     if buy_order.discriminator != ORDER_DISCRIMINATOR || sell_order.discriminator != ORDER_DISCRIMINATOR {
@@ -2025,8 +2208,8 @@ fn process_execute_trade(
     
     let current_time = get_current_timestamp()?;
     
-    // Calculate execution price (mid-price or buyer's price)
-    let exec_price = args.execution_price.unwrap_or(buy_order.price);
+    // Calculate execution price (use provided price or buyer's price)
+    let exec_price = args.price;
     
     // Verify execution price is within bounds
     if exec_price < sell_order.price || exec_price > buy_order.price {
@@ -2073,8 +2256,8 @@ fn process_execute_trade(
     msg!("Match amount: {}", match_amount);
     msg!("Execution price: {} (e6)", exec_price);
     msg!("Trade value: {} USDC (e6)", trade_value);
-    msg!("Buy order {}: {}/{}", args.buy_order_id, buy_order.filled_amount, buy_order.amount);
-    msg!("Sell order {}: {}/{}", args.sell_order_id, sell_order.filled_amount, sell_order.amount);
+    msg!("Taker order {}: {}/{}", args.taker_order_id, buy_order.filled_amount, buy_order.amount);
+    msg!("Maker order {}: {}/{}", args.maker_order_id, sell_order.filled_amount, sell_order.amount);
     
     Ok(())
 }
@@ -2103,7 +2286,7 @@ fn process_propose_result(
     let system_program_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2125,7 +2308,7 @@ fn process_propose_result(
     }
     
     // Load market
-    let market = Market::try_from_slice(&market_info.data.borrow())?;
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2217,7 +2400,7 @@ fn process_challenge_result(
     let proposal_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2233,7 +2416,7 @@ fn process_challenge_result(
     }
     
     // Load proposal
-    let mut proposal = OracleProposal::try_from_slice(&proposal_info.data.borrow())?;
+    let mut proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
     if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2247,7 +2430,7 @@ fn process_challenge_result(
     }
     
     // Verify different result proposed
-    if args.proposed_result == proposal.proposed_result {
+    if args.result == proposal.proposed_result {
         msg!("Error: Challenge result must be different from proposal");
         return Err(PredictionMarketError::SameResultAsProposal.into());
     }
@@ -2255,14 +2438,14 @@ fn process_challenge_result(
     // Update proposal with challenge
     proposal.status = ProposalStatus::Disputed;
     proposal.challenger = Some(*challenger_info.key);
-    proposal.challenger_result = Some(args.proposed_result);
+    proposal.challenger_result = Some(args.result);
     proposal.challenger_bond = config.proposer_bond_e6;
     proposal.serialize(&mut *proposal_info.data.borrow_mut())?;
     
     msg!("Result challenged successfully");
     msg!("Market ID: {}", args.market_id);
     msg!("Challenger: {}", challenger_info.key);
-    msg!("Challenger's Proposed Result: {:?}", args.proposed_result);
+    msg!("Challenger's Proposed Result: {:?}", args.result);
     
     Ok(())
 }
@@ -2287,13 +2470,13 @@ fn process_finalize_result(
     let proposal_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2309,7 +2492,7 @@ fn process_finalize_result(
     }
     
     // Load proposal
-    let mut proposal = OracleProposal::try_from_slice(&proposal_info.data.borrow())?;
+    let mut proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
     if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2364,7 +2547,7 @@ fn process_resolve_dispute(
     let proposal_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2375,7 +2558,7 @@ fn process_resolve_dispute(
     }
     
     // Load market
-    let mut market = Market::try_from_slice(&market_info.data.borrow())?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2391,7 +2574,7 @@ fn process_resolve_dispute(
     }
     
     // Load proposal
-    let mut proposal = OracleProposal::try_from_slice(&proposal_info.data.borrow())?;
+    let mut proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
     if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2410,7 +2593,7 @@ fn process_resolve_dispute(
     
     // Update market with final result
     market.status = MarketStatus::Resolved;
-    market.final_result = Some(args.final_result);
+    market.final_result = Some(args.result);
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
@@ -2420,7 +2603,7 @@ fn process_resolve_dispute(
     
     msg!("Dispute resolved successfully");
     msg!("Market ID: {}", market.market_id);
-    msg!("Final Result: {:?}", args.final_result);
+    msg!("Final Result: {:?}", args.result);
     
     Ok(())
 }
@@ -2463,7 +2646,7 @@ fn process_claim_winnings(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load market
-    let market = Market::try_from_slice(&market_info.data.borrow())?;
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2498,7 +2681,7 @@ fn process_claim_winnings(
     }
     
     // Load position
-    let mut position = Position::try_from_slice(&position_info.data.borrow())?;
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
     if position.discriminator != POSITION_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2711,7 +2894,7 @@ fn process_refund_cancelled_market(
     let token_program_info = next_account_info(account_info_iter)?;
     
     // Load market
-    let market = Market::try_from_slice(&market_info.data.borrow())?;
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
     if market.discriminator != MARKET_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2744,7 +2927,7 @@ fn process_refund_cancelled_market(
     }
     
     // Load position
-    let mut position = Position::try_from_slice(&position_info.data.borrow())?;
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
     if position.discriminator != POSITION_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2834,7 +3017,7 @@ fn process_update_admin(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2870,7 +3053,7 @@ fn process_update_oracle_admin(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2907,7 +3090,7 @@ fn process_set_paused(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2942,7 +3125,7 @@ fn process_update_oracle_config(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let mut config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -2983,7 +3166,7 @@ fn process_add_authorized_caller(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
@@ -3016,7 +3199,7 @@ fn process_remove_authorized_caller(
     let config_info = next_account_info(account_info_iter)?;
     
     // Load config
-    let config = PredictionMarketConfig::try_from_slice(&config_info.data.borrow())?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }

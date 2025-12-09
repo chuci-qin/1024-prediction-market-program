@@ -22,6 +22,7 @@ pub const ORACLE_PROPOSAL_DISCRIMINATOR: u64 = 0x4F5241434C455F50; // "ORACLE_P"
 pub const PM_CONFIG_SEED: &[u8] = b"pm_config";
 pub const MARKET_SEED: &[u8] = b"market";
 pub const ORDER_SEED: &[u8] = b"order";
+pub const ORDER_ESCROW_SEED: &[u8] = b"order_escrow";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const MARKET_VAULT_SEED: &[u8] = b"market_vault";
 pub const YES_MINT_SEED: &[u8] = b"yes_mint";
@@ -462,8 +463,12 @@ pub struct Order {
     /// PDA bump
     pub bump: u8,
     
+    /// Escrow token account (for sell orders)
+    /// This holds the tokens that the seller is offering
+    pub escrow_token_account: Option<Pubkey>,
+    
     /// Reserved for future use
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 31],
 }
 
 impl Order {
@@ -482,7 +487,8 @@ impl Order {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 32; // reserved
+        + 1 + 32 // escrow_token_account (Option<Pubkey>)
+        + 31; // reserved (reduced by 1)
     
     /// PDA seeds
     pub fn seeds(market_id: u64, order_id: u64) -> Vec<Vec<u8>> {
@@ -491,6 +497,21 @@ impl Order {
             market_id.to_le_bytes().to_vec(),
             order_id.to_le_bytes().to_vec(),
         ]
+    }
+    
+    /// Escrow token account PDA seeds
+    /// For sell orders, tokens are locked in this escrow
+    pub fn escrow_seeds(market_id: u64, order_id: u64) -> Vec<Vec<u8>> {
+        vec![
+            ORDER_ESCROW_SEED.to_vec(),
+            market_id.to_le_bytes().to_vec(),
+            order_id.to_le_bytes().to_vec(),
+        ]
+    }
+    
+    /// Check if this is a sell order with escrowed tokens
+    pub fn has_escrow(&self) -> bool {
+        self.side == OrderSide::Sell && self.escrow_token_account.is_some()
     }
     
     /// Remaining unfilled amount

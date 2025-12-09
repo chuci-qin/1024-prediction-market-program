@@ -2,7 +2,21 @@
 
 > 最后更新: 2025-12-08  
 > 版本: v0.2.0  
-> 状态: ✅ 核心功能完成 (待测试)
+> 状态: ✅ 已部署到 1024Chain Testnet
+
+---
+
+## 🚀 部署信息
+
+| 项目 | 值 |
+|-----|-----|
+| **Program ID** | `FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58` |
+| **网络** | 1024Chain Testnet |
+| **RPC** | `https://testnet-rpc.1024chain.com/rpc/` |
+| **升级权限** | `267TEwwHkJUHz42TLNggDCecNhYHFxcRALmR17bPkvU8` (Faucet) |
+| **程序大小** | 323,896 bytes (~316KB) |
+| **部署时间** | 2025-12-08 |
+| **部署 Slot** | 44006543 |
 
 ---
 
@@ -709,14 +723,48 @@
 - [x] 实现 process_claim_winnings - 领取收益
 - [x] 实现 process_refund_cancelled_market - 退款
 - [x] 实现所有管理员操作指令
+- [x] 修复编译错误 (error.rs 新增 35+ 错误类型)
+- [x] 修复字段名不匹配问题
+- [x] 生成 Program ID: `FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58`
+- [x] 🚀 **成功部署到 1024Chain Testnet!**
+- [x] 创建测试脚本 (tests/test_initialize.ts)
 
 #### 问题:
-- 无
+- 本地部署遇到 TPU 客户端问题，需要通过 SSH 在服务器上部署
 
-#### 明天计划:
-- [ ] 编写单元测试
-- [ ] 编写集成测试
-- [ ] 部署到 Devnet 测试
+#### 2025-12-08 (Day 1 续):
+- [x] ✅ 运行 Initialize 初始化程序 - **成功!**
+  - Config PDA: `BLPdJuvYHzUf1mcNTEBQHHt1SzD3LxTgsNqQe5tCeD1k`
+  - Tx: `2uzLvGm6P4MiVATA9WF1VXMMdG9PQ12L7oweMG6kWqSRjD1rcjbc2wdEoz14YYC3gSshHErbz86RhKFB5JfbuFSZ`
+- [x] ✅ 测试 CreateMarket 创建市场 - **成功!**
+  - Market ID: 1
+  - Market PDA: `EbMCkdnsqtXeiVYKyvnmy1mEdKfBcTefFQ5u8B3eyjYj`
+  - YES Mint: `2DkRWKK8GAmUF8377tMwDvij1thayXD6kmwgHT98JD4L`
+  - NO Mint: `AWqnZhhDnk2E48sNVZ6VMhHpTBnwiCDmTdKCD9v3ZGNv`
+  - Tx: `QnrB6VTpzXZnAupjSxbYZ7ur1XGAMV9uvMChDRJFrX1smPqaG7fSyicdHKJGC3XKEjcnS5GFQoK2aXyNh5BGiQL`
+- [x] ✅ 设计数据库表 - 8 张表
+  - `prediction_markets` - 预测市场表
+  - `prediction_orders` - 订单表
+  - `prediction_positions` - 持仓表
+  - `prediction_trades` - 交易记录表
+  - `prediction_oracle_proposals` - Oracle 提案表
+  - `prediction_complete_set_ops` - 完整集操作表
+  - `prediction_price_history` - 价格历史表
+  - `prediction_user_stats` - 用户统计表
+- [x] ✅ 创建 onchain-client prediction_market 模块
+  - `mod.rs` - 模块定义
+  - `state.rs` - 状态类型
+  - `pda.rs` - PDA 推导
+  - `instructions.rs` - 指令构建器
+  - `client.rs` - 高级客户端
+
+#### 下一步:
+- [ ] 激活测试市场 (ActivateMarket)
+- [ ] 铸造完整集测试 (MintCompleteSet)
+- [ ] 下单测试 (PlaceOrder)
+- [ ] 创建 prediction-market-domain crate
+- [ ] 创建 prediction-market-api 网关
+- [ ] 集成前端 UI
 
 ---
 

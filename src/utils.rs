@@ -1,5 +1,6 @@
 //! Utility functions for the Prediction Market Program
 
+use borsh::BorshDeserialize;
 use solana_program::{
     account_info::AccountInfo,
     clock::Clock,
@@ -15,6 +16,14 @@ use solana_program::{
 
 use crate::error::PredictionMarketError;
 use crate::state::PRICE_PRECISION;
+
+/// Safely deserialize account data using BorshDeserialize::deserialize
+/// This does NOT require the slice to be fully consumed, which is important
+/// when the account has padding bytes at the end.
+pub fn deserialize_account<T: BorshDeserialize>(data: &[u8]) -> Result<T, ProgramError> {
+    T::deserialize(&mut &data[..])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
 
 /// Check if a signer is authorized
 pub fn check_signer(account: &AccountInfo) -> ProgramResult {
