@@ -18,7 +18,7 @@ use crate::error::PredictionMarketError;
 use crate::instruction::PredictionMarketInstruction;
 use crate::state::{
     PredictionMarketConfig, Market, Order, Position, OracleProposal,
-    MarketType, MarketStatus, MarketResult, ReviewStatus, OrderStatus, ProposalStatus,
+    MarketType, MarketStatus, MarketResult, ReviewStatus, OrderStatus, ProposalStatus, Outcome,
     PM_CONFIG_SEED, MARKET_SEED, ORDER_SEED, ORDER_ESCROW_SEED, POSITION_SEED, 
     MARKET_VAULT_SEED, YES_MINT_SEED, NO_MINT_SEED, ORACLE_PROPOSAL_SEED, OUTCOME_MINT_SEED,
     PM_CONFIG_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORDER_DISCRIMINATOR, 
@@ -225,6 +225,24 @@ pub fn process_instruction(
         PredictionMarketInstruction::RelayerClaimMultiOutcomeWinnings(args) => {
             msg!("Instruction: RelayerClaimMultiOutcomeWinnings");
             process_relayer_claim_multi_outcome_winnings(program_id, accounts, args)
+        }
+        
+        // === Multi-Outcome Matching Operations ===
+        PredictionMarketInstruction::MatchMintMulti(args) => {
+            msg!("Instruction: MatchMintMulti");
+            process_match_mint_multi(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::MatchBurnMulti(args) => {
+            msg!("Instruction: MatchBurnMulti");
+            process_match_burn_multi(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerMatchMintMulti(args) => {
+            msg!("Instruction: RelayerMatchMintMulti");
+            process_relayer_match_mint_multi(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerMatchBurnMulti(args) => {
+            msg!("Instruction: RelayerMatchBurnMulti");
+            process_relayer_match_burn_multi(program_id, accounts, args)
         }
     }
 }
@@ -1386,6 +1404,26 @@ fn process_place_order(
         }
     }
     
+    // Log IOC/FOK order type for off-chain matching engine reference
+    // IOC (Immediate Or Cancel): Matching engine should match what's possible, 
+    //     then call CancelOrder on remaining amount
+    // FOK (Fill Or Kill): Matching engine should only match if entire order 
+    //     can be filled, otherwise reject the order entirely
+    match args.order_type {
+        crate::state::OrderType::IOC => {
+            msg!("📝 IOC order: Will be partially filled or cancelled by matching engine");
+        }
+        crate::state::OrderType::FOK => {
+            msg!("📝 FOK order: Must be completely filled or will be rejected");
+        }
+        crate::state::OrderType::GTD => {
+            msg!("📝 GTD order: Valid until {:?}", args.expiration_time);
+        }
+        crate::state::OrderType::GTC => {
+            msg!("📝 GTC order: Good till cancelled");
+        }
+    }
+    
     // Allocate order_id
     let order_id = market.next_order_id;
     let order_id_bytes = order_id.to_le_bytes();
@@ -1496,6 +1534,12 @@ fn process_place_order(
     };
     
     // Initialize order
+    // Derive outcome_index from outcome for binary markets
+    let outcome_index = match args.outcome {
+        Outcome::Yes => 0u8,
+        Outcome::No => 1u8,
+    };
+    
     let order = Order {
         discriminator: ORDER_DISCRIMINATOR,
         order_id,
@@ -1503,6 +1547,7 @@ fn process_place_order(
         owner: *user_info.key,
         side: args.side,
         outcome: args.outcome,
+        outcome_index,
         price: args.price,
         amount: args.amount,
         filled_amount: 0,
@@ -1513,7 +1558,7 @@ fn process_place_order(
         updated_at: current_time,
         bump: order_bump,
         escrow_token_account,
-        reserved: [0u8; 31],
+        reserved: [0u8; 30],
     };
     
     order.serialize(&mut *order_info.data.borrow_mut())?;
@@ -2047,8 +2092,33 @@ fn process_match_burn(
     // Verify orders have escrow (sell orders should have escrowed tokens)
     if !yes_order.has_escrow() || !no_order.has_escrow() {
         msg!("Error: Sell orders must have escrowed tokens for MatchBurn");
-        return Err(PredictionMarketError::InvalidAccountData.into());
+        return Err(PredictionMarketError::EscrowNotFound.into());
     }
+    
+    // P5.2.3: Verify escrow balances are sufficient
+    use crate::utils::{verify_escrow_balance, verify_escrow_pda};
+    
+    // Verify YES escrow PDA
+    verify_escrow_pda(
+        yes_seller_token_info,
+        program_id,
+        args.market_id,
+        args.yes_order_id,
+    )?;
+    
+    // Verify NO escrow PDA
+    verify_escrow_pda(
+        no_seller_token_info,
+        program_id,
+        args.market_id,
+        args.no_order_id,
+    )?;
+    
+    // Verify YES escrow has enough tokens
+    verify_escrow_balance(yes_seller_token_info, match_amount)?;
+    
+    // Verify NO escrow has enough tokens
+    verify_escrow_balance(no_seller_token_info, match_amount)?;
     
     // Calculate PDA seeds for signing
     let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
@@ -2176,7 +2246,7 @@ fn process_execute_trade(
     // Account 4: Sell Order (writable)
     let sell_order_info = next_account_info(account_info_iter)?;
     
-    // Account 5: Seller's Token Account (writable)
+    // Account 5: Seller's Token Account / Escrow (writable)
     let seller_token_info = next_account_info(account_info_iter)?;
     
     // Account 6: Buyer's Token Account (writable)
@@ -2184,6 +2254,15 @@ fn process_execute_trade(
     
     // Account 7: Token Program
     let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Buyer Position PDA (writable) - Phase 2 addition
+    let buyer_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: Seller Position PDA (writable) - Phase 2 addition
+    let seller_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: System Program - Phase 2 addition (for Position creation)
+    let system_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
     let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -2287,10 +2366,43 @@ fn process_execute_trade(
         return Err(PredictionMarketError::InvalidExecutionPrice.into());
     }
     
-    // Note: In a full implementation, we would:
-    // 1. Transfer tokens from seller's escrowed account to buyer
-    // 2. Transfer USDC from buyer's locked funds to seller
-    // For now, this is a simplified version that assumes tokens are already escrowed
+    // P5.2.4: Verify sell order has escrow with sufficient tokens
+    if !sell_order.has_escrow() {
+        msg!("Error: Sell order must have escrowed tokens for ExecuteTrade");
+        return Err(PredictionMarketError::EscrowNotFound.into());
+    }
+    
+    // Verify escrow PDA and balance
+    use crate::utils::{verify_escrow_balance, verify_escrow_pda};
+    
+    // Note: seller_token_info should be the escrow token account for sell orders
+    verify_escrow_pda(
+        seller_token_info,
+        program_id,
+        args.market_id,
+        args.maker_order_id,
+    )?;
+    
+    verify_escrow_balance(seller_token_info, match_amount)?;
+    
+    // Transfer tokens from seller's escrow to buyer's token account
+    // Using sell_order PDA as signer
+    let sell_order_seeds: &[&[u8]] = &[ORDER_SEED, &market_id_bytes, &maker_order_id_bytes, &[sell_order.bump]];
+    
+    invoke_signed(
+        &spl_token::instruction::transfer(
+            token_program_info.key,
+            seller_token_info.key,
+            buyer_token_info.key,
+            sell_order_info.key, // Sell order PDA is the owner of escrow
+            &[],
+            match_amount,
+        )?,
+        &[seller_token_info.clone(), buyer_token_info.clone(), sell_order_info.clone(), token_program_info.clone()],
+        &[sell_order_seeds],
+    )?;
+    
+    msg!("Transferred {} tokens from escrow to buyer", match_amount);
     
     // Update orders
     buy_order.filled_amount += match_amount;
@@ -2313,6 +2425,86 @@ fn process_execute_trade(
     
     // Calculate trade value
     let trade_value = ((match_amount as u128) * (exec_price as u128) / (PRICE_PRECISION as u128)) as i64;
+    
+    // Phase 2: Update Positions
+    // Verify Buyer Position PDA
+    let buyer_owner = buy_order.owner;
+    let (buyer_position_pda, buyer_position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, buyer_owner.as_ref()],
+        program_id,
+    );
+    if *buyer_position_info.key != buyer_position_pda {
+        msg!("Error: Invalid buyer position PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Verify Seller Position PDA  
+    let seller_owner = sell_order.owner;
+    let (seller_position_pda, seller_position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, seller_owner.as_ref()],
+        program_id,
+    );
+    if *seller_position_info.key != seller_position_pda {
+        msg!("Error: Invalid seller position PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load or create Buyer Position
+    let buyer_position_exists = buyer_position_info.data_len() > 0 && 
+        buyer_position_info.owner == program_id;
+    
+    if buyer_position_exists {
+        // Update existing buyer position
+        let mut buyer_position = deserialize_account::<Position>(&buyer_position_info.data.borrow())?;
+        if buyer_position.discriminator != POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Buyer receives tokens at exec_price
+        buyer_position.add_tokens(buy_order.outcome, match_amount, exec_price, current_time);
+        buyer_position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+        msg!("Updated buyer position: {} tokens added", match_amount);
+    } else {
+        // Create new buyer position
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let buyer_position_seeds: &[&[u8]] = &[POSITION_SEED, &market_id_bytes, buyer_owner.as_ref(), &[buyer_position_bump]];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                buyer_position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), buyer_position_info.clone(), system_program_info.clone()],
+            &[buyer_position_seeds],
+        )?;
+        
+        let mut buyer_position = Position::new(args.market_id, buyer_owner, buyer_position_bump, current_time);
+        buyer_position.add_tokens(buy_order.outcome, match_amount, exec_price, current_time);
+        buyer_position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+        msg!("Created new buyer position with {} tokens", match_amount);
+    }
+    
+    // Update Seller Position (must exist - they're selling tokens they own)
+    if seller_position_info.data_len() > 0 && seller_position_info.owner == program_id {
+        let mut seller_position = deserialize_account::<Position>(&seller_position_info.data.borrow())?;
+        if seller_position.discriminator != POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Seller removes tokens at exec_price (realize PnL)
+        seller_position.remove_tokens(sell_order.outcome, match_amount, exec_price, current_time);
+        seller_position.serialize(&mut *seller_position_info.data.borrow_mut())?;
+        msg!("Updated seller position: {} tokens removed", match_amount);
+    } else {
+        // Seller should have a position if they're selling tokens
+        // This is an edge case - create an empty position and subtract (will go negative in logic)
+        msg!("Warning: Seller position not found, skipping position update");
+    }
     
     // Update market stats
     market.total_volume_e6 += trade_value;
@@ -3227,6 +3419,8 @@ fn process_add_authorized_caller(
     accounts: &[AccountInfo],
     args: AddAuthorizedCallerArgs,
 ) -> ProgramResult {
+    use crate::state::{AuthorizedCallers, AUTHORIZED_CALLERS_SEED, AUTHORIZED_CALLERS_DISCRIMINATOR};
+    
     let account_info_iter = &mut accounts.iter();
     
     // Account 0: Admin (signer)
@@ -3235,6 +3429,12 @@ fn process_add_authorized_caller(
     
     // Account 1: PredictionMarketConfig
     let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: AuthorizedCallers PDA (writable)
+    let callers_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: System Program (for creating if needed)
+    let system_program_info = next_account_info(account_info_iter)?;
     
     // Load config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -3247,9 +3447,61 @@ fn process_add_authorized_caller(
         return Err(PredictionMarketError::Unauthorized.into());
     }
     
-    // Note: In a full implementation, we would maintain a list of authorized callers
-    // For now, this is a placeholder
-    msg!("Authorized caller added (placeholder)");
+    // Verify AuthorizedCallers PDA
+    let (callers_pda, callers_bump) = Pubkey::find_program_address(
+        &[AUTHORIZED_CALLERS_SEED],
+        program_id,
+    );
+    if *callers_info.key != callers_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    // Check if PDA needs to be created
+    if callers_info.data_len() == 0 {
+        // Create the AuthorizedCallers account
+        let rent = Rent::get()?;
+        let space = AuthorizedCallers::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let callers_seeds: &[&[u8]] = &[AUTHORIZED_CALLERS_SEED, &[callers_bump]];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                admin_info.key,
+                callers_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[admin_info.clone(), callers_info.clone(), system_program_info.clone()],
+            &[callers_seeds],
+        )?;
+        
+        // Initialize with the new caller
+        let mut callers = AuthorizedCallers::new(callers_bump, current_time);
+        callers.add_caller(args.caller, current_time)
+            .map_err(|_| PredictionMarketError::InvalidAccountData)?;
+        callers.serialize(&mut *callers_info.data.borrow_mut())?;
+        
+        msg!("Created AuthorizedCallers registry and added first caller");
+    } else {
+        // Load existing and add caller
+        let mut callers = deserialize_account::<AuthorizedCallers>(&callers_info.data.borrow())?;
+        if callers.discriminator != AUTHORIZED_CALLERS_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        callers.add_caller(args.caller, current_time)
+            .map_err(|_| {
+                msg!("Error: Caller already authorized or list is full");
+                PredictionMarketError::InvalidAccountData
+            })?;
+        
+        callers.serialize(&mut *callers_info.data.borrow_mut())?;
+    }
+    
+    msg!("Authorized caller added successfully");
     msg!("Caller: {}", args.caller);
     
     Ok(())
@@ -3260,6 +3512,8 @@ fn process_remove_authorized_caller(
     accounts: &[AccountInfo],
     args: RemoveAuthorizedCallerArgs,
 ) -> ProgramResult {
+    use crate::state::{AuthorizedCallers, AUTHORIZED_CALLERS_SEED, AUTHORIZED_CALLERS_DISCRIMINATOR};
+    
     let account_info_iter = &mut accounts.iter();
     
     // Account 0: Admin (signer)
@@ -3268,6 +3522,9 @@ fn process_remove_authorized_caller(
     
     // Account 1: PredictionMarketConfig
     let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: AuthorizedCallers PDA (writable)
+    let callers_info = next_account_info(account_info_iter)?;
     
     // Load config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -3280,10 +3537,40 @@ fn process_remove_authorized_caller(
         return Err(PredictionMarketError::Unauthorized.into());
     }
     
-    // Note: In a full implementation, we would maintain a list of authorized callers
-    // For now, this is a placeholder
-    msg!("Authorized caller removed (placeholder)");
+    // Verify AuthorizedCallers PDA
+    let (callers_pda, _) = Pubkey::find_program_address(
+        &[AUTHORIZED_CALLERS_SEED],
+        program_id,
+    );
+    if *callers_info.key != callers_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Check if PDA exists
+    if callers_info.data_len() == 0 {
+        msg!("Error: AuthorizedCallers registry not initialized");
+        return Err(PredictionMarketError::AccountNotInitialized.into());
+    }
+    
+    // Load and update
+    let mut callers = deserialize_account::<AuthorizedCallers>(&callers_info.data.borrow())?;
+    if callers.discriminator != AUTHORIZED_CALLERS_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    callers.remove_caller(&args.caller, current_time)
+        .map_err(|_| {
+            msg!("Error: Caller not found in authorized list");
+            PredictionMarketError::InvalidAccountData
+        })?;
+    
+    callers.serialize(&mut *callers_info.data.borrow_mut())?;
+    
+    msg!("Authorized caller removed successfully");
     msg!("Caller: {}", args.caller);
+    msg!("Remaining callers: {}", callers.count);
     
     Ok(())
 }
@@ -3884,6 +4171,7 @@ fn process_place_multi_outcome_order(
         owner: *user_info.key,
         side: args.side,
         outcome,
+        outcome_index: args.outcome_index,
         price: args.price,
         amount: args.amount,
         filled_amount: 0,
@@ -3894,7 +4182,7 @@ fn process_place_multi_outcome_order(
         updated_at: current_time,
         bump: order_bump,
         escrow_token_account: None,
-        reserved: [0u8; 31],
+        reserved: [0u8; 30],
     };
     
     order.serialize(&mut *order_info.data.borrow_mut())?;
@@ -4502,6 +4790,12 @@ fn process_relayer_place_order(
         &[order_seeds],
     )?;
     
+    // Derive outcome_index from outcome for binary markets
+    let outcome_index = match args.outcome {
+        Outcome::Yes => 0u8,
+        Outcome::No => 1u8,
+    };
+    
     // Initialize Order
     let order = Order {
         discriminator: ORDER_DISCRIMINATOR,
@@ -4510,6 +4804,7 @@ fn process_relayer_place_order(
         owner: args.user_wallet,
         side: args.side,
         outcome: args.outcome,
+        outcome_index,
         price: args.price,
         amount: args.amount,
         filled_amount: 0,
@@ -4520,7 +4815,7 @@ fn process_relayer_place_order(
         updated_at: current_time,
         bump: order_bump,
         escrow_token_account: None,
-        reserved: [0u8; 31],
+        reserved: [0u8; 30],
     };
     
     order.serialize(&mut *order_info.data.borrow_mut())?;
@@ -4763,7 +5058,7 @@ fn process_relayer_place_multi_outcome_order(
 
 /// Relayer 版本的 ClaimMultiOutcomeWinnings
 fn process_relayer_claim_multi_outcome_winnings(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,
     accounts: &[AccountInfo],
     args: RelayerClaimMultiOutcomeWinningsArgs,
 ) -> ProgramResult {
@@ -4782,5 +5077,723 @@ fn process_relayer_claim_multi_outcome_winnings(
     msg!("Market ID: {}", args.market_id);
     
     Ok(())
+}
+
+// ============================================================================
+// Multi-Outcome Matching Operations
+// ============================================================================
+
+/// Process MatchMintMulti instruction
+/// 
+/// Complete Set Mint for multi-outcome market:
+/// When sum of all outcome buy prices <= 1.0, mint one token of each outcome.
+/// 
+/// Account layout:
+/// 0. [signer] Authorized Caller (Relayer/Matcher)
+/// 1. [writable] PredictionMarketConfig
+/// 2. [writable] Market
+/// 3. [] Market Vault
+/// 4. [] Token Program
+/// 5. [] System Program
+/// Dynamic accounts (3 per outcome, for i in 0..num_outcomes):
+///   6 + 3*i + 0: [writable] Order PDA
+///   6 + 3*i + 1: [writable] Outcome Token Mint
+///   6 + 3*i + 2: [writable] Buyer's Token Account
+fn process_match_mint_multi(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchMintMultiArgs,
+) -> ProgramResult {
+    use crate::state::MAX_OUTCOMES_FOR_MATCH;
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // ========== Fixed Accounts (6) ==========
+    
+    // Account 0: Authorized Caller (signer)
+    let caller_info = next_account_info(account_info_iter)?;
+    check_signer(caller_info)?;
+    
+    // Account 1: PredictionMarketConfig (writable)
+    let config_info = next_account_info(account_info_iter)?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify authorized caller
+    verify_authorized_caller(&config, caller_info.key)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Validate market
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Verify market is multi-outcome type
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("Error: MatchMintMulti requires MultiOutcome market type");
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    // Validate num_outcomes
+    if args.num_outcomes < 2 || args.num_outcomes > MAX_OUTCOMES_FOR_MATCH {
+        msg!("Invalid num_outcomes: {}, max is {}", args.num_outcomes, MAX_OUTCOMES_FOR_MATCH);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate num_outcomes matches market
+    if args.num_outcomes != market.num_outcomes {
+        msg!("num_outcomes {} != market.num_outcomes {}", args.num_outcomes, market.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate orders count matches num_outcomes
+    if args.orders.len() != args.num_outcomes as usize {
+        msg!("Orders count {} != num_outcomes {}", args.orders.len(), args.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate price sum <= 1.0 (price conservation for minting)
+    let total_price: u64 = args.orders.iter().map(|(_, _, p)| p).sum();
+    if total_price > PRICE_PRECISION {
+        msg!("Total price {} > 1.0 ({})", total_price, PRICE_PRECISION);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    // Account 3: Market Vault (not used in mint, but validated)
+    let _market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: System Program
+    let _system_program_info = next_account_info(account_info_iter)?;
+    
+    // ========== Dynamic Accounts (3 per outcome) ==========
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Calculate market PDA seeds for signing (market is mint authority)
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Track minimum matchable amount across all orders
+    let mut min_remaining: u64 = args.amount;
+    
+    // Collect order and account info for processing
+    struct OutcomeData<'a> {
+        order_info: AccountInfo<'a>,
+        mint_info: AccountInfo<'a>,
+        buyer_token_info: AccountInfo<'a>,
+        order: Order,
+        outcome_index: u8,
+        price: u64,
+    }
+    
+    let mut outcome_data: Vec<OutcomeData> = Vec::with_capacity(args.num_outcomes as usize);
+    
+    // Parse and validate dynamic accounts
+    for i in 0..args.num_outcomes as usize {
+        let (expected_outcome_idx, order_id, price) = args.orders[i];
+        
+        // Verify outcome_index is sequential (0, 1, 2, ...)
+        if expected_outcome_idx != i as u8 {
+            msg!("Error: outcome_index {} at position {} (expected {})", expected_outcome_idx, i, i);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Parse accounts for this outcome
+        let order_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let buyer_token_info = next_account_info(account_info_iter)?;
+        
+        // Verify Order PDA
+        let order_id_bytes = order_id.to_le_bytes();
+        let (order_pda, _) = Pubkey::find_program_address(
+            &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *order_info.key != order_pda {
+            msg!("Error: Invalid Order PDA for outcome {}", i);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Load and validate order
+        let order = deserialize_account::<Order>(&order_info.data.borrow())?;
+        
+        if order.discriminator != ORDER_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Verify order is a Buy order
+        if order.side != crate::state::OrderSide::Buy {
+            msg!("Error: Order {} must be Buy order for MatchMintMulti", order_id);
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        
+        // Verify outcome_index matches
+        if order.outcome_index != expected_outcome_idx {
+            msg!("Error: Order outcome_index {} != expected {}", order.outcome_index, expected_outcome_idx);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Verify order is active
+        if !order.is_active() {
+            msg!("Error: Order {} is not active", order_id);
+            return Err(PredictionMarketError::OrderNotActive.into());
+        }
+        
+        // Verify price is <= order's limit price (for buy, lower is better for matcher)
+        if price > order.price {
+            msg!("Error: Match price {} exceeds order limit price {}", price, order.price);
+            return Err(PredictionMarketError::PriceExceedsLimit.into());
+        }
+        
+        // Verify Outcome Mint PDA
+        let (outcome_mint_pda, _) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[expected_outcome_idx]],
+            program_id,
+        );
+        if *mint_info.key != outcome_mint_pda {
+            msg!("Error: Invalid Outcome Mint PDA for outcome {}", i);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Track minimum remaining amount
+        let remaining = order.remaining_amount();
+        if remaining < min_remaining {
+            min_remaining = remaining;
+        }
+        
+        outcome_data.push(OutcomeData {
+            order_info: order_info.clone(),
+            mint_info: mint_info.clone(),
+            buyer_token_info: buyer_token_info.clone(),
+            order,
+            outcome_index: expected_outcome_idx,
+            price,
+        });
+    }
+    
+    // Calculate actual match amount
+    let match_amount = min_remaining.min(args.amount);
+    
+    if match_amount == 0 {
+        msg!("Error: No matchable amount");
+        return Err(PredictionMarketError::NoMatchableAmount.into());
+    }
+    
+    // ========== Execute: Mint tokens to each buyer ==========
+    
+    for data in outcome_data.iter() {
+        // Mint outcome tokens to buyer
+        invoke_signed(
+            &spl_token::instruction::mint_to(
+                token_program_info.key,
+                data.mint_info.key,
+                data.buyer_token_info.key,
+                market_info.key, // Market PDA is the mint authority
+                &[],
+                match_amount,
+            )?,
+            &[
+                data.mint_info.clone(),
+                data.buyer_token_info.clone(),
+                market_info.clone(),
+                token_program_info.clone(),
+            ],
+            &[market_seeds],
+        )?;
+        
+        msg!("Minted {} tokens for outcome {} to buyer", match_amount, data.outcome_index);
+    }
+    
+    // ========== Update orders ==========
+    
+    for data in outcome_data.iter() {
+        let mut order = data.order.clone();
+        order.filled_amount += match_amount;
+        
+        if order.filled_amount >= order.amount {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartialFilled;
+        }
+        order.updated_at = current_time;
+        order.serialize(&mut *data.order_info.data.borrow_mut())?;
+    }
+    
+    // ========== Update market stats ==========
+    
+    market.total_minted += match_amount;
+    market.total_volume_e6 += match_amount as i64;
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // ========== Update config stats ==========
+    
+    config.total_volume_e6 += match_amount as i64;
+    config.total_minted_sets += match_amount;
+    config.serialize(&mut *config_info.data.borrow_mut())?;
+    
+    // ========== Log success ==========
+    
+    msg!("✅ MatchMintMulti executed successfully");
+    msg!("   Market ID: {}", args.market_id);
+    msg!("   Num outcomes: {}", args.num_outcomes);
+    msg!("   Match amount: {}", match_amount);
+    msg!("   Total price: {} ({}%)", total_price, total_price * 100 / PRICE_PRECISION);
+    
+    // Log spread (protocol revenue)
+    let spread = PRICE_PRECISION.saturating_sub(total_price);
+    if spread > 0 {
+        msg!("   Spread (protocol revenue): {} ({}%)", spread, spread * 100 / PRICE_PRECISION);
+    }
+    
+    Ok(())
+}
+
+/// Process MatchBurnMulti instruction
+/// 
+/// Complete Set Burn for multi-outcome market:
+/// When sum of all outcome sell prices >= 1.0, burn tokens and return USDC.
+/// 
+/// Account layout:
+/// 0. [signer] Authorized Caller (Relayer/Matcher)
+/// 1. [writable] PredictionMarketConfig
+/// 2. [writable] Market
+/// 3. [writable] Market Vault (USDC vault)
+/// 4. [] Token Program
+/// 5. [] System Program
+/// Dynamic accounts (4 per outcome, for i in 0..num_outcomes):
+///   6 + 4*i + 0: [writable] Order PDA
+///   6 + 4*i + 1: [writable] Outcome Token Mint
+///   6 + 4*i + 2: [writable] Seller's Token Account (Escrow)
+///   6 + 4*i + 3: [writable] Seller's USDC Account
+fn process_match_burn_multi(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchBurnMultiArgs,
+) -> ProgramResult {
+    use crate::state::MAX_OUTCOMES_FOR_MATCH;
+    use crate::utils::{verify_escrow_balance, verify_escrow_pda};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // ========== Fixed Accounts (6) ==========
+    
+    // Account 0: Authorized Caller (signer)
+    let caller_info = next_account_info(account_info_iter)?;
+    check_signer(caller_info)?;
+    
+    // Account 1: PredictionMarketConfig (writable)
+    let config_info = next_account_info(account_info_iter)?;
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify authorized caller
+    verify_authorized_caller(&config, caller_info.key)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Validate market
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Verify market is multi-outcome type
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("Error: MatchBurnMulti requires MultiOutcome market type");
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    // Validate num_outcomes
+    if args.num_outcomes < 2 || args.num_outcomes > MAX_OUTCOMES_FOR_MATCH {
+        msg!("Invalid num_outcomes: {}, max is {}", args.num_outcomes, MAX_OUTCOMES_FOR_MATCH);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate num_outcomes matches market
+    if args.num_outcomes != market.num_outcomes {
+        msg!("num_outcomes {} != market.num_outcomes {}", args.num_outcomes, market.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate orders count
+    if args.orders.len() != args.num_outcomes as usize {
+        msg!("Orders count {} != num_outcomes {}", args.orders.len(), args.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate price sum >= 1.0 (price conservation for burning)
+    let total_price: u64 = args.orders.iter().map(|(_, _, p)| p).sum();
+    if total_price < PRICE_PRECISION {
+        msg!("Total price {} < 1.0 ({})", total_price, PRICE_PRECISION);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    // Account 3: Market Vault (writable, for USDC transfers)
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Verify market vault
+    if *market_vault_info.key != market.market_vault {
+        return Err(PredictionMarketError::InvalidMarketVault.into());
+    }
+    
+    // Account 4: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: System Program
+    let _system_program_info = next_account_info(account_info_iter)?;
+    
+    // ========== Dynamic Accounts (4 per outcome) ==========
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Calculate market PDA seeds for signing (market controls vault)
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
+    
+    // Track minimum matchable amount across all orders
+    let mut min_remaining: u64 = args.amount;
+    
+    // Collect order and account info for processing
+    struct OutcomeData<'a> {
+        order_info: AccountInfo<'a>,
+        mint_info: AccountInfo<'a>,
+        seller_token_info: AccountInfo<'a>,
+        seller_usdc_info: AccountInfo<'a>,
+        order: Order,
+        order_id: u64,
+        order_bump: u8,
+        outcome_index: u8,
+        price: u64,
+    }
+    
+    let mut outcome_data: Vec<OutcomeData> = Vec::with_capacity(args.num_outcomes as usize);
+    
+    // Parse and validate dynamic accounts
+    for i in 0..args.num_outcomes as usize {
+        let (expected_outcome_idx, order_id, price) = args.orders[i];
+        
+        // Verify outcome_index is sequential (0, 1, 2, ...)
+        if expected_outcome_idx != i as u8 {
+            msg!("Error: outcome_index {} at position {} (expected {})", expected_outcome_idx, i, i);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Parse accounts for this outcome
+        let order_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let seller_token_info = next_account_info(account_info_iter)?;
+        let seller_usdc_info = next_account_info(account_info_iter)?;
+        
+        // Verify Order PDA
+        let order_id_bytes = order_id.to_le_bytes();
+        let (order_pda, order_bump) = Pubkey::find_program_address(
+            &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *order_info.key != order_pda {
+            msg!("Error: Invalid Order PDA for outcome {}", i);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Load and validate order
+        let order = deserialize_account::<Order>(&order_info.data.borrow())?;
+        
+        if order.discriminator != ORDER_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Verify order is a Sell order
+        if order.side != crate::state::OrderSide::Sell {
+            msg!("Error: Order {} must be Sell order for MatchBurnMulti", order_id);
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        
+        // Verify outcome_index matches
+        if order.outcome_index != expected_outcome_idx {
+            msg!("Error: Order outcome_index {} != expected {}", order.outcome_index, expected_outcome_idx);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Verify order is active
+        if !order.is_active() {
+            msg!("Error: Order {} is not active", order_id);
+            return Err(PredictionMarketError::OrderNotActive.into());
+        }
+        
+        // Verify price is >= order's limit price (for sell, higher is better for seller)
+        if price < order.price {
+            msg!("Error: Match price {} below order limit price {}", price, order.price);
+            return Err(PredictionMarketError::PriceBelowLimit.into());
+        }
+        
+        // Verify sell order has escrow
+        if !order.has_escrow() {
+            msg!("Error: Sell order {} must have escrowed tokens", order_id);
+            return Err(PredictionMarketError::EscrowNotFound.into());
+        }
+        
+        // Verify Outcome Mint PDA
+        let (outcome_mint_pda, _) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[expected_outcome_idx]],
+            program_id,
+        );
+        if *mint_info.key != outcome_mint_pda {
+            msg!("Error: Invalid Outcome Mint PDA for outcome {}", i);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Verify escrow PDA
+        verify_escrow_pda(
+            seller_token_info,
+            program_id,
+            args.market_id,
+            order_id,
+        )?;
+        
+        // Track minimum remaining amount
+        let remaining = order.remaining_amount();
+        if remaining < min_remaining {
+            min_remaining = remaining;
+        }
+        
+        outcome_data.push(OutcomeData {
+            order_info: order_info.clone(),
+            mint_info: mint_info.clone(),
+            seller_token_info: seller_token_info.clone(),
+            seller_usdc_info: seller_usdc_info.clone(),
+            order,
+            order_id,
+            order_bump,
+            outcome_index: expected_outcome_idx,
+            price,
+        });
+    }
+    
+    // Calculate actual match amount
+    let match_amount = min_remaining.min(args.amount);
+    
+    if match_amount == 0 {
+        msg!("Error: No matchable amount");
+        return Err(PredictionMarketError::NoMatchableAmount.into());
+    }
+    
+    // Verify all escrows have sufficient balance
+    for data in outcome_data.iter() {
+        verify_escrow_balance(&data.seller_token_info, match_amount)?;
+    }
+    
+    // ========== Execute: Burn tokens and transfer USDC ==========
+    
+    for data in outcome_data.iter() {
+        // Calculate order PDA seeds for signing (order PDA owns escrow)
+        let order_id_bytes = data.order_id.to_le_bytes();
+        let order_seeds: &[&[u8]] = &[
+            ORDER_SEED,
+            &market_id_bytes,
+            &order_id_bytes,
+            &[data.order_bump],
+        ];
+        
+        // Burn outcome tokens from seller's escrow
+        invoke_signed(
+            &spl_token::instruction::burn(
+                token_program_info.key,
+                data.seller_token_info.key,
+                data.mint_info.key,
+                data.order_info.key, // Order PDA is the owner of escrow
+                &[],
+                match_amount,
+            )?,
+            &[
+                data.seller_token_info.clone(),
+                data.mint_info.clone(),
+                data.order_info.clone(),
+                token_program_info.clone(),
+            ],
+            &[order_seeds],
+        )?;
+        
+        // Calculate USDC proceeds for this seller (proportional to price)
+        let proceeds = ((match_amount as u128) * (data.price as u128) / (PRICE_PRECISION as u128)) as u64;
+        
+        // Transfer USDC from vault to seller
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program_info.key,
+                market_vault_info.key,
+                data.seller_usdc_info.key,
+                market_info.key, // Market PDA is the vault authority
+                &[],
+                proceeds,
+            )?,
+            &[
+                market_vault_info.clone(),
+                data.seller_usdc_info.clone(),
+                market_info.clone(),
+                token_program_info.clone(),
+            ],
+            &[market_seeds],
+        )?;
+        
+        msg!("Burned {} tokens for outcome {}, paid {} USDC", 
+             match_amount, data.outcome_index, proceeds);
+    }
+    
+    // ========== Update orders ==========
+    
+    for data in outcome_data.iter() {
+        let mut order = data.order.clone();
+        order.filled_amount += match_amount;
+        
+        if order.filled_amount >= order.amount {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartialFilled;
+        }
+        order.updated_at = current_time;
+        order.serialize(&mut *data.order_info.data.borrow_mut())?;
+    }
+    
+    // ========== Update market stats ==========
+    
+    market.total_minted = market.total_minted.saturating_sub(match_amount);
+    market.total_volume_e6 += match_amount as i64;
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // ========== Update config stats ==========
+    
+    config.total_volume_e6 += match_amount as i64;
+    config.serialize(&mut *config_info.data.borrow_mut())?;
+    
+    // ========== Log success ==========
+    
+    msg!("✅ MatchBurnMulti executed successfully");
+    msg!("   Market ID: {}", args.market_id);
+    msg!("   Num outcomes: {}", args.num_outcomes);
+    msg!("   Match amount: {}", match_amount);
+    msg!("   Total price: {} ({}%)", total_price, total_price * 100 / PRICE_PRECISION);
+    
+    // Log spread (protocol revenue from price > 1.0)
+    let spread = total_price.saturating_sub(PRICE_PRECISION);
+    if spread > 0 {
+        msg!("   Spread (protocol revenue): {} ({}%)", spread, spread * 100 / PRICE_PRECISION);
+    }
+    
+    Ok(())
+}
+
+/// Relayer version of MatchMintMulti
+fn process_relayer_match_mint_multi(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMatchMintMultiArgs,
+) -> ProgramResult {
+    // Convert to regular args and call main implementation
+    let match_args = MatchMintMultiArgs {
+        market_id: args.market_id,
+        num_outcomes: args.num_outcomes,
+        amount: args.amount,
+        orders: args.orders,
+    };
+    
+    msg!("RelayerMatchMintMulti -> delegating to MatchMintMulti");
+    process_match_mint_multi(program_id, accounts, match_args)
+}
+
+/// Relayer version of MatchBurnMulti
+fn process_relayer_match_burn_multi(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMatchBurnMultiArgs,
+) -> ProgramResult {
+    // Convert to regular args and call main implementation
+    let match_args = MatchBurnMultiArgs {
+        market_id: args.market_id,
+        num_outcomes: args.num_outcomes,
+        amount: args.amount,
+        orders: args.orders,
+    };
+    
+    msg!("RelayerMatchBurnMulti -> delegating to MatchBurnMulti");
+    process_match_burn_multi(program_id, accounts, match_args)
+}
+
+/// Verify that caller is an authorized matching engine
+/// 
+/// Checks in order:
+/// 1. Is caller the admin?
+/// 2. Is caller the oracle_admin?
+/// 3. If AuthorizedCallers account is provided, is caller in the list?
+fn verify_authorized_caller(config: &PredictionMarketConfig, caller: &Pubkey) -> ProgramResult {
+    // Check if caller is admin or oracle_admin (always authorized)
+    if caller == &config.admin || caller == &config.oracle_admin {
+        return Ok(());
+    }
+    
+    msg!("Unauthorized caller: {}", caller);
+    Err(PredictionMarketError::Unauthorized.into())
+}
+
+/// Verify that caller is an authorized matching engine with AuthorizedCallers PDA check
+/// 
+/// This version also checks the AuthorizedCallers registry
+fn verify_authorized_caller_with_registry(
+    config: &PredictionMarketConfig, 
+    caller: &Pubkey,
+    callers_info: Option<&AccountInfo>,
+) -> ProgramResult {
+    use crate::state::{AuthorizedCallers, AUTHORIZED_CALLERS_DISCRIMINATOR};
+    
+    // Check if caller is admin or oracle_admin (always authorized)
+    if caller == &config.admin || caller == &config.oracle_admin {
+        return Ok(());
+    }
+    
+    // Check AuthorizedCallers registry if provided
+    if let Some(callers_account) = callers_info {
+        if callers_account.data_len() > 0 {
+            if let Ok(callers) = deserialize_account::<AuthorizedCallers>(&callers_account.data.borrow()) {
+                if callers.discriminator == AUTHORIZED_CALLERS_DISCRIMINATOR {
+                    if callers.is_authorized(caller) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    
+    msg!("Unauthorized caller: {}", caller);
+    Err(PredictionMarketError::Unauthorized.into())
 }
 

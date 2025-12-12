@@ -182,6 +182,144 @@ pub fn calculate_tokens_for_usdc(usdc_amount: u64, price: u64) -> u64 {
     ((usdc_amount as u128) * (PRICE_PRECISION as u128) / (price as u128)) as u64
 }
 
+// ============================================================================
+// Escrow Verification Functions (Phase 5)
+// ============================================================================
+
+/// Verify that an escrow token account is owned by the expected PDA
+/// 
+/// This function checks:
+/// 1. The account owner is the SPL Token program
+/// 2. The token account owner field matches the expected PDA
+/// 
+/// # Arguments
+/// * `escrow_info` - The escrow token account info
+/// * `expected_owner` - The expected PDA that should own the token account
+/// * `token_program_id` - The SPL Token program ID
+/// 
+/// # Returns
+/// * `Ok(())` if ownership is verified
+/// * `Err(InvalidEscrowOwner)` if ownership verification fails
+pub fn verify_escrow_ownership(
+    escrow_info: &AccountInfo,
+    expected_owner: &Pubkey,
+    token_program_id: &Pubkey,
+) -> ProgramResult {
+    // Check account is owned by Token program
+    if escrow_info.owner != token_program_id {
+        msg!("Escrow account not owned by Token program");
+        return Err(PredictionMarketError::InvalidTokenAccount.into());
+    }
+    
+    // Deserialize token account to check owner field
+    // Token account layout: mint(32) + owner(32) + amount(8) + ...
+    let data = escrow_info.try_borrow_data()?;
+    if data.len() < 72 {
+        msg!("Invalid escrow account data length");
+        return Err(PredictionMarketError::InvalidTokenAccount.into());
+    }
+    
+    // Owner is at offset 32 (after mint pubkey)
+    let owner_bytes: [u8; 32] = data[32..64].try_into()
+        .map_err(|_| PredictionMarketError::InvalidTokenAccount)?;
+    let token_owner = Pubkey::from(owner_bytes);
+    
+    if token_owner != *expected_owner {
+        msg!("Escrow owner mismatch: expected {}, got {}", expected_owner, token_owner);
+        return Err(PredictionMarketError::InvalidEscrowOwner.into());
+    }
+    
+    Ok(())
+}
+
+/// Verify that an escrow token account has sufficient balance
+/// 
+/// # Arguments
+/// * `escrow_info` - The escrow token account info
+/// * `required_amount` - The minimum required balance
+/// 
+/// # Returns
+/// * `Ok(current_balance)` if balance is sufficient
+/// * `Err(InsufficientEscrowBalance)` if balance is insufficient
+pub fn verify_escrow_balance(
+    escrow_info: &AccountInfo,
+    required_amount: u64,
+) -> Result<u64, ProgramError> {
+    // Deserialize token account to check balance
+    // Token account layout: mint(32) + owner(32) + amount(8) + ...
+    let data = escrow_info.try_borrow_data()?;
+    if data.len() < 72 {
+        msg!("Invalid escrow account data length");
+        return Err(PredictionMarketError::InvalidTokenAccount.into());
+    }
+    
+    // Amount is at offset 64 (after mint + owner)
+    let amount_bytes: [u8; 8] = data[64..72].try_into()
+        .map_err(|_| PredictionMarketError::InvalidTokenAccount)?;
+    let current_balance = u64::from_le_bytes(amount_bytes);
+    
+    if current_balance < required_amount {
+        msg!("Insufficient escrow balance: has {}, needs {}", current_balance, required_amount);
+        return Err(PredictionMarketError::InsufficientEscrowBalance.into());
+    }
+    
+    Ok(current_balance)
+}
+
+/// Verify escrow PDA matches the expected derivation
+/// 
+/// # Arguments
+/// * `escrow_info` - The escrow token account info
+/// * `program_id` - The program ID
+/// * `market_id` - The market ID
+/// * `order_id` - The order ID
+/// 
+/// # Returns
+/// * `Ok(bump)` if PDA is valid
+/// * `Err(InvalidPDA)` if PDA doesn't match
+pub fn verify_escrow_pda(
+    escrow_info: &AccountInfo,
+    program_id: &Pubkey,
+    market_id: u64,
+    order_id: u64,
+) -> Result<u8, ProgramError> {
+    use crate::state::ORDER_ESCROW_SEED;
+    
+    let market_id_bytes = market_id.to_le_bytes();
+    let order_id_bytes = order_id.to_le_bytes();
+    
+    let (expected_pda, bump) = Pubkey::find_program_address(
+        &[ORDER_ESCROW_SEED, &market_id_bytes, &order_id_bytes],
+        program_id,
+    );
+    
+    if *escrow_info.key != expected_pda {
+        msg!("Escrow PDA mismatch: expected {}, got {}", expected_pda, escrow_info.key);
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    Ok(bump)
+}
+
+/// Get the token balance from a token account
+/// 
+/// # Arguments
+/// * `token_account` - The token account info
+/// 
+/// # Returns
+/// * `Ok(balance)` - The current token balance
+/// * `Err` - If the account data is invalid
+pub fn get_token_balance(token_account: &AccountInfo) -> Result<u64, ProgramError> {
+    let data = token_account.try_borrow_data()?;
+    if data.len() < 72 {
+        return Err(PredictionMarketError::InvalidTokenAccount.into());
+    }
+    
+    let amount_bytes: [u8; 8] = data[64..72].try_into()
+        .map_err(|_| PredictionMarketError::InvalidTokenAccount)?;
+    Ok(u64::from_le_bytes(amount_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +404,50 @@ mod tests {
         // Safe div
         assert_eq!(safe_div_u64(100, 5).unwrap(), 20);
         assert!(safe_div_u64(100, 0).is_err());
+    }
+
+    #[test]
+    fn test_is_order_expired() {
+        use crate::state::OrderType;
+        
+        let current_time = 1000i64;
+        
+        // GTC order - never expires
+        assert!(!is_order_expired_by_type(OrderType::GTC, None, current_time));
+        
+        // GTD order - not expired
+        assert!(!is_order_expired_by_type(OrderType::GTD, Some(2000), current_time));
+        
+        // GTD order - expired
+        assert!(is_order_expired_by_type(OrderType::GTD, Some(500), current_time));
+        
+        // IOC/FOK orders - handled by matching engine
+        assert!(!is_order_expired_by_type(OrderType::IOC, None, current_time));
+        assert!(!is_order_expired_by_type(OrderType::FOK, None, current_time));
+    }
+}
+
+/// Check if an order is expired based on its type and expiration time
+/// 
+/// - GTC: Never expires
+/// - GTD: Expires at specified time
+/// - IOC/FOK: Handled by matching engine (returns false, let matching engine decide)
+pub fn is_order_expired_by_type(
+    order_type: crate::state::OrderType,
+    expiration_time: Option<i64>,
+    current_time: i64,
+) -> bool {
+    match order_type {
+        crate::state::OrderType::GTC => false,
+        crate::state::OrderType::GTD => {
+            if let Some(exp_time) = expiration_time {
+                current_time >= exp_time
+            } else {
+                false
+            }
+        }
+        // IOC/FOK are not time-based expiration - matching engine handles them
+        crate::state::OrderType::IOC | crate::state::OrderType::FOK => false,
     }
 }
 

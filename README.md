@@ -41,8 +41,10 @@
 
 | 网络 | Program ID |
 |------|-----------|
-| 1024Chain Testnet | `PMrkT1yH6Bna4JKBMKjS1NU7qAcM2y7V9Q3VNUa8PRA` |
+| 1024Chain Testnet | `FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu` |
 | 1024Chain Mainnet | TBD |
+
+**⚠️ 多选市场限制**: 最大支持 **16 个 outcomes** 用于撮合操作 (MatchMintMulti/MatchBurnMulti)，以避免超过 Solana 64 账户限制
 
 ### 系统架构
 
@@ -354,6 +356,38 @@ pub struct OracleProposal {
 }
 ```
 
+### 6. AuthorizedCallers (授权调用方注册)
+
+**PDA Seeds:** `["authorized_callers"]`
+
+```rust
+/// 最多 10 个授权调用方
+pub const MAX_AUTHORIZED_CALLERS: usize = 10;
+
+pub struct AuthorizedCallers {
+    pub discriminator: u64,
+    pub count: u8,                          // 当前数量
+    pub callers: [Pubkey; 10],              // 授权 pubkey 列表
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub bump: u8,
+    pub reserved: [u8; 32],
+}
+
+impl AuthorizedCallers {
+    /// 检查 pubkey 是否授权
+    pub fn is_authorized(&self, caller: &Pubkey) -> bool;
+    
+    /// 添加授权调用方
+    pub fn add_caller(&mut self, caller: Pubkey) -> Result<(), ()>;
+    
+    /// 移除授权调用方
+    pub fn remove_caller(&mut self, caller: &Pubkey) -> Result<(), ()>;
+}
+```
+
+**用途:** 存储授权的撮合引擎 (Matching Engine) 公钥，用于验证 MatchMint/MatchBurn/ExecuteTrade 等指令的调用方。
+
 ---
 
 ## 指令详解
@@ -412,7 +446,51 @@ pub struct CreateMarketArgs {
 | `CancelOrder` | 取消订单 |
 | `MatchMint` | 撮合买单 (YES Buy + NO Buy = Mint) |
 | `MatchBurn` | 撮合卖单 (YES Sell + NO Sell = Burn) |
+| `MatchMintMulti` | 多选市场撮合铸造 (N 个 Buy 订单 = Mint N tokens) |
+| `MatchBurnMulti` | 多选市场撮合销毁 (N 个 Sell 订单 = Burn N tokens) |
 | `ExecuteTrade` | 直接成交 (Taker vs Maker) |
+
+**MatchMintMulti 参数 (新增):**
+
+```rust
+pub struct MatchMintMultiArgs {
+    pub market_id: u64,
+    pub num_outcomes: u8,    // 2-16 (受账户数限制)
+    pub amount: u64,         // 撮合数量
+    pub orders: Vec<(u8, u64, u64)>,  // (outcome_index, order_id, price_e6)
+}
+
+// 账户列表 (6 + 3*N 个账户):
+// 0. [signer] Authorized Caller (Matching Engine)
+// 1. [] PredictionMarketConfig
+// 2. [writable] Market
+// 3. [writable] Market Vault
+// 4. [] Token Program
+// 5. [] System Program
+// 对于每个 outcome i (0..N-1):
+//   6 + 3*i + 0: [writable] Order PDA
+//   6 + 3*i + 1: [writable] Outcome Token Mint
+//   6 + 3*i + 2: [writable] Buyer's Token Account
+```
+
+**MatchBurnMulti 参数 (新增):**
+
+```rust
+pub struct MatchBurnMultiArgs {
+    pub market_id: u64,
+    pub num_outcomes: u8,
+    pub amount: u64,
+    pub orders: Vec<(u8, u64, u64)>,  // Sell 订单信息
+}
+```
+
+**Compute Budget 建议:**
+
+| Outcomes 数量 | 预估 CU | 建议请求 |
+|--------------|---------|---------|
+| 2-4 | ~80,000 | 150,000 |
+| 5-8 | ~150,000 | 250,000 |
+| 9-16 | ~300,000 | 450,000 |
 
 **PlaceOrder 参数:**
 
@@ -556,6 +634,27 @@ Maker: Sell YES @ $0.60 (100 tokens)
 = Transfer 100 YES from Maker to Taker
 = Transfer $60 USDC from Taker to Maker
 ```
+
+**ExecuteTrade 账户列表 (更新):**
+
+```rust
+/// ExecuteTrade 账户 (11 个):
+/// 0. [signer] Authorized Caller
+/// 1. [writable] PredictionMarketConfig
+/// 2. [writable] Market
+/// 3. [writable] Buy Order (Taker)
+/// 4. [writable] Sell Order (Maker)
+/// 5. [writable] Seller's Token Account / Escrow
+/// 6. [writable] Buyer's Token Account
+/// 7. [] Token Program
+/// 8. [writable] Buyer Position PDA      // 自动创建/更新
+/// 9. [writable] Seller Position PDA     // 更新
+/// 10. [] System Program                  // 用于创建 Position
+```
+
+**Position 更新逻辑:**
+- Buyer Position: 调用 `add_tokens()` 增加代币持仓
+- Seller Position: 调用 `remove_tokens()` 减少代币持仓并记录已实现盈亏
 
 ---
 
@@ -866,4 +965,46 @@ MIT
 
 ---
 
-*Last Updated: 2025-12-09*
+*Last Updated: 2025-12-08*
+
+---
+
+## 更新日志 (v2.0.0)
+
+### 新增功能
+
+1. **多选市场撮合指令**
+   - `MatchMintMulti` - N 个买单撮合铸造
+   - `MatchBurnMulti` - N 个卖单撮合销毁
+   - 支持 2-16 个 outcomes
+
+2. **AuthorizedCallers PDA**
+   - 独立的授权调用方注册表
+   - 最多 10 个授权地址
+   - `AddAuthorizedCaller` / `RemoveAuthorizedCaller` 指令
+
+3. **ExecuteTrade Position 更新**
+   - 自动创建/更新 Buyer Position
+   - 自动更新 Seller Position
+   - 记录已实现盈亏
+
+4. **Escrow 验证增强**
+   - `verify_escrow_pda()` - PDA 验证
+   - `verify_escrow_balance()` - 余额验证
+   - Sell 订单的代币托管验证
+
+5. **Order 结构统一**
+   - 新增 `outcome_index` 字段 (0-based)
+   - 二元/多选市场统一接口
+
+6. **CPI 集成同步**
+   - 更新 Vault Program 指令索引
+   - `PredictionMarketLock` = 16
+   - `PredictionMarketUnlock` = 17
+   - `PredictionMarketSettle` = 18
+
+7. **新增错误码**
+   - `TooManyOutcomes` (650)
+   - `OutcomesMismatch` (651)
+   - `PriceSumExceedsOne` (652)
+   - `PriceSumBelowOne` (653)

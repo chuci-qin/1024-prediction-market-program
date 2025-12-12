@@ -119,6 +119,9 @@ pub enum PredictionMarketError {
     #[error("Invalid token mint")]
     InvalidTokenMint = 119,
     
+    #[error("Invalid market type")]
+    InvalidMarketType = 120,
+    
     // === Order Errors (200-299) ===
     
     #[error("Order not found")]
@@ -268,6 +271,38 @@ pub enum PredictionMarketError {
     
     #[error("Token burn failed")]
     TokenBurnFailed = 604,
+    
+    #[error("Invalid escrow owner")]
+    InvalidEscrowOwner = 605,
+    
+    #[error("Insufficient escrow balance")]
+    InsufficientEscrowBalance = 606,
+    
+    #[error("Escrow account not found")]
+    EscrowNotFound = 607,
+    
+    #[error("Escrow already exists")]
+    EscrowAlreadyExists = 608,
+    
+    // === Multi-Outcome Errors (650-699) ===
+    
+    #[error("Too many outcomes (max 16 for matching)")]
+    TooManyOutcomes = 650,
+    
+    #[error("Outcomes count mismatch")]
+    OutcomesMismatch = 651,
+    
+    #[error("Price sum exceeds 1.0 (for minting)")]
+    PriceSumExceedsOne = 652,
+    
+    #[error("Price sum below 1.0 (for burning)")]
+    PriceSumBelowOne = 653,
+    
+    #[error("Invalid outcome index")]
+    InvalidOutcomeIndex = 654,
+    
+    #[error("Missing outcome in order set")]
+    MissingOutcomeOrder = 655,
     
     // === CPI Errors (700-799) ===
     

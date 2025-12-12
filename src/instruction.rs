@@ -513,6 +513,39 @@ pub enum PredictionMarketInstruction {
     
     /// Relayer 版本的 ClaimMultiOutcomeWinnings
     RelayerClaimMultiOutcomeWinnings(RelayerClaimMultiOutcomeWinningsArgs),
+    
+    // =========================================================================
+    // Multi-Outcome Matching Operations (250-259)
+    // =========================================================================
+    
+    /// Match multiple buy orders via minting for multi-outcome market
+    /// 
+    /// Called by off-chain matching engine (authorized caller)
+    /// When sum of all outcome buy prices <= 1.0, mint one token of each outcome.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Authorized Caller (matching engine)
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Market Vault
+    /// 4. `[]` Token Program
+    /// 5. `[]` System Program
+    /// 6..6+3*N: Dynamic accounts for each outcome
+    MatchMintMulti(MatchMintMultiArgs),
+    
+    /// Match multiple sell orders via burning for multi-outcome market
+    /// 
+    /// Called by off-chain matching engine (authorized caller)
+    /// When sum of all outcome sell prices >= 1.0, burn tokens and return USDC.
+    /// 
+    /// Accounts: (same structure as MatchMintMulti)
+    MatchBurnMulti(MatchBurnMultiArgs),
+    
+    /// Relayer version of MatchMintMulti
+    RelayerMatchMintMulti(RelayerMatchMintMultiArgs),
+    
+    /// Relayer version of MatchBurnMulti
+    RelayerMatchBurnMulti(RelayerMatchBurnMultiArgs),
 }
 
 // ============================================================================
@@ -671,6 +704,71 @@ pub struct ExecuteTradeArgs {
     pub amount: u64,
     /// Execution price (e6)
     pub price: u64,
+}
+
+// === Multi-Outcome Matching Operations ===
+
+/// Order info for multi-outcome matching: (outcome_index, order_id, price_e6)
+pub type MultiOutcomeOrderInfo = (u8, u64, u64);
+
+/// Arguments for MatchMintMulti instruction (Multi-Outcome Market)
+/// 
+/// Complete Set Mint for multi-outcome market:
+/// When sum of all outcome buy prices <= 1.0, mint one token of each outcome.
+/// 
+/// Accounts:
+/// 0. `[signer]` Authorized Caller (Matching Engine)
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` Market Vault (receives USDC)
+/// 4. `[]` Token Program
+/// 5. `[]` System Program
+/// 6..6+3*N: For each outcome i (i = 0..N-1):
+///    - `[writable]` Order PDA
+///    - `[writable]` Outcome Token Mint
+///    - `[writable]` Buyer's Token Account
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MatchMintMultiArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16, limited to avoid account limit)
+    pub num_outcomes: u8,
+    /// Amount to match/mint
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    /// Must contain exactly num_outcomes entries
+    /// Sum of all prices must be <= 1_000_000 (1.0 USDC)
+    pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
+/// Arguments for MatchBurnMulti instruction (Multi-Outcome Market)
+/// 
+/// Complete Set Burn for multi-outcome market:
+/// When sum of all outcome sell prices >= 1.0, burn tokens and return USDC.
+/// 
+/// Accounts:
+/// 0. `[signer]` Authorized Caller (Matching Engine)
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` Market Vault (releases USDC)
+/// 4. `[]` Token Program
+/// 5. `[]` System Program
+/// 6..6+3*N: For each outcome i (i = 0..N-1):
+///    - `[writable]` Order PDA
+///    - `[writable]` Outcome Token Mint
+///    - `[writable]` Seller's Token Account
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MatchBurnMultiArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16)
+    pub num_outcomes: u8,
+    /// Amount to match/burn
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    /// Must contain exactly num_outcomes entries
+    /// Sum of all prices must be >= 1_000_000 (1.0 USDC)
+    pub orders: Vec<MultiOutcomeOrderInfo>,
 }
 
 // === Oracle / Resolution ===
@@ -936,6 +1034,36 @@ pub struct RelayerClaimMultiOutcomeWinningsArgs {
     pub market_id: u64,
 }
 
+// === Multi-Outcome Matching (Relayer Versions) ===
+
+/// Relayer版本的MatchMintMulti
+/// 
+/// Relayer/Admin signs instead of individual users
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerMatchMintMultiArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16)
+    pub num_outcomes: u8,
+    /// Amount to match/mint
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
+/// Relayer版本的MatchBurnMulti
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerMatchBurnMultiArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16)
+    pub num_outcomes: u8,
+    /// Amount to match/burn
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -987,6 +1115,100 @@ mod tests {
             PredictionMarketInstruction::PlaceOrder(a) => {
                 assert_eq!(a.market_id, 1);
                 assert_eq!(a.price, 650_000);
+            }
+            _ => panic!("Wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn test_match_mint_multi_serialization() {
+        // 3-outcome market: sum of prices = 0.33 + 0.33 + 0.34 = 1.00
+        let args = MatchMintMultiArgs {
+            market_id: 1,
+            num_outcomes: 3,
+            amount: 100,
+            orders: vec![
+                (0, 101, 330_000), // outcome 0, order 101, price 0.33
+                (1, 102, 330_000), // outcome 1, order 102, price 0.33
+                (2, 103, 340_000), // outcome 2, order 103, price 0.34
+            ],
+        };
+        let ix = PredictionMarketInstruction::MatchMintMulti(args);
+        let serialized = ix.try_to_vec().unwrap();
+        assert!(!serialized.is_empty());
+        
+        let deserialized: PredictionMarketInstruction = 
+            BorshDeserialize::try_from_slice(&serialized).unwrap();
+        match deserialized {
+            PredictionMarketInstruction::MatchMintMulti(a) => {
+                assert_eq!(a.market_id, 1);
+                assert_eq!(a.num_outcomes, 3);
+                assert_eq!(a.amount, 100);
+                assert_eq!(a.orders.len(), 3);
+                
+                // Verify total price sum
+                let total_price: u64 = a.orders.iter().map(|(_, _, p)| p).sum();
+                assert_eq!(total_price, 1_000_000); // Exactly 1.0 USDC
+            }
+            _ => panic!("Wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn test_match_burn_multi_serialization() {
+        // 4-outcome market: sum of prices = 0.30 + 0.30 + 0.20 + 0.25 = 1.05 >= 1.0
+        let args = MatchBurnMultiArgs {
+            market_id: 2,
+            num_outcomes: 4,
+            amount: 50,
+            orders: vec![
+                (0, 201, 300_000), // outcome 0, order 201, price 0.30
+                (1, 202, 300_000), // outcome 1, order 202, price 0.30
+                (2, 203, 200_000), // outcome 2, order 203, price 0.20
+                (3, 204, 250_000), // outcome 3, order 204, price 0.25
+            ],
+        };
+        let ix = PredictionMarketInstruction::MatchBurnMulti(args);
+        let serialized = ix.try_to_vec().unwrap();
+        
+        let deserialized: PredictionMarketInstruction = 
+            BorshDeserialize::try_from_slice(&serialized).unwrap();
+        match deserialized {
+            PredictionMarketInstruction::MatchBurnMulti(a) => {
+                assert_eq!(a.market_id, 2);
+                assert_eq!(a.num_outcomes, 4);
+                assert_eq!(a.amount, 50);
+                assert_eq!(a.orders.len(), 4);
+                
+                // Verify total price sum >= 1.0
+                let total_price: u64 = a.orders.iter().map(|(_, _, p)| p).sum();
+                assert!(total_price >= 1_000_000); // Should be >= 1.0 USDC
+            }
+            _ => panic!("Wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn test_relayer_match_mint_multi_serialization() {
+        let args = RelayerMatchMintMultiArgs {
+            market_id: 3,
+            num_outcomes: 2,
+            amount: 200,
+            orders: vec![
+                (0, 301, 500_000), // YES, order 301, price 0.50
+                (1, 302, 500_000), // NO, order 302, price 0.50
+            ],
+        };
+        let ix = PredictionMarketInstruction::RelayerMatchMintMulti(args);
+        let serialized = ix.try_to_vec().unwrap();
+        
+        let deserialized: PredictionMarketInstruction = 
+            BorshDeserialize::try_from_slice(&serialized).unwrap();
+        match deserialized {
+            PredictionMarketInstruction::RelayerMatchMintMulti(a) => {
+                assert_eq!(a.market_id, 3);
+                assert_eq!(a.num_outcomes, 2);
+                assert_eq!(a.orders.len(), 2);
             }
             _ => panic!("Wrong instruction type"),
         }

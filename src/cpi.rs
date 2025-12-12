@@ -23,24 +23,27 @@ use crate::error::PredictionMarketError;
 /// Lock user funds for prediction market (CPI to Vault Program)
 /// 
 /// This moves USDC from available_balance to pm_locked in the user's Vault account.
+/// 
+/// Vault Instruction Index: 16 (PredictionMarketLock)
 pub fn cpi_lock_for_prediction<'a>(
     vault_program: &AccountInfo<'a>,
     vault_config: &AccountInfo<'a>,
     user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
     caller_program: &AccountInfo<'a>,
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
     msg!("CPI: Lock {} for prediction market", amount);
     
-    // Instruction discriminator for LockForPrediction (to be defined in Vault Program)
-    // This is a placeholder - actual implementation depends on Vault Program instruction encoding
-    let mut data = vec![20u8]; // Instruction index (placeholder)
+    // Instruction discriminator for PredictionMarketLock = index 16
+    let mut data = vec![16u8];
     data.extend_from_slice(&amount.to_le_bytes());
     
     let accounts = vec![
         vault_config.clone(),
         user_account.clone(),
+        pm_user_account.clone(),
         caller_program.clone(),
     ];
     
@@ -64,22 +67,27 @@ pub fn cpi_lock_for_prediction<'a>(
 /// Release user funds from prediction market (CPI to Vault Program)
 /// 
 /// This moves USDC from pm_locked back to available_balance.
+/// 
+/// Vault Instruction Index: 17 (PredictionMarketUnlock)
 pub fn cpi_release_from_prediction<'a>(
     vault_program: &AccountInfo<'a>,
     vault_config: &AccountInfo<'a>,
     user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
     caller_program: &AccountInfo<'a>,
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
     msg!("CPI: Release {} from prediction market", amount);
     
-    let mut data = vec![21u8]; // Instruction index (placeholder)
+    // Instruction index for PredictionMarketUnlock = 17
+    let mut data = vec![17u8];
     data.extend_from_slice(&amount.to_le_bytes());
     
     let accounts = vec![
         vault_config.clone(),
         user_account.clone(),
+        pm_user_account.clone(),
         caller_program.clone(),
     ];
     
@@ -103,10 +111,12 @@ pub fn cpi_release_from_prediction<'a>(
 /// Settle prediction market winnings (CPI to Vault Program)
 /// 
 /// This releases locked funds and adds settlement amount to pm_pending_settlement.
+/// 
+/// Vault Instruction Index: 18 (PredictionMarketSettle)
 pub fn cpi_prediction_settle<'a>(
     vault_program: &AccountInfo<'a>,
     vault_config: &AccountInfo<'a>,
-    user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
     caller_program: &AccountInfo<'a>,
     locked_amount: u64,
     settlement_amount: u64,
@@ -115,13 +125,14 @@ pub fn cpi_prediction_settle<'a>(
     msg!("CPI: Settle prediction market - locked: {}, settlement: {}", 
          locked_amount, settlement_amount);
     
-    let mut data = vec![22u8]; // Instruction index (placeholder)
+    // Instruction index for PredictionMarketSettle = 18
+    let mut data = vec![18u8];
     data.extend_from_slice(&locked_amount.to_le_bytes());
     data.extend_from_slice(&settlement_amount.to_le_bytes());
     
     let accounts = vec![
         vault_config.clone(),
-        user_account.clone(),
+        pm_user_account.clone(),
         caller_program.clone(),
     ];
     

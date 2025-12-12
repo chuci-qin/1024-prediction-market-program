@@ -29,6 +29,7 @@ pub const YES_MINT_SEED: &[u8] = b"yes_mint";
 pub const NO_MINT_SEED: &[u8] = b"no_mint";
 pub const ORACLE_PROPOSAL_SEED: &[u8] = b"oracle_proposal";
 pub const OUTCOME_MINT_SEED: &[u8] = b"outcome_mint"; // For multi-outcome markets
+pub const AUTHORIZED_CALLERS_SEED: &[u8] = b"authorized_callers"; // For matching engine callers
 
 // ============================================================================
 // Constants
@@ -36,6 +37,11 @@ pub const OUTCOME_MINT_SEED: &[u8] = b"outcome_mint"; // For multi-outcome marke
 
 /// Maximum number of outcomes for multi-outcome markets
 pub const MAX_OUTCOMES: usize = 32;
+
+/// Maximum outcomes for matching operations (MatchMintMulti/MatchBurnMulti)
+/// Limited to 16 to avoid exceeding Solana's 64 account limit per transaction
+/// Formula: 6 fixed accounts + 3 * num_outcomes = 54 accounts for 16 outcomes
+pub const MAX_OUTCOMES_FOR_MATCH: u8 = 16;
 
 /// Maximum length of market question (bytes)
 pub const MAX_QUESTION_LEN: usize = 256;
@@ -654,8 +660,13 @@ pub struct Order {
     /// Order side (Buy/Sell)
     pub side: OrderSide,
     
-    /// Outcome type (YES/NO)
+    /// Outcome type (YES/NO) - for binary markets backward compatibility
     pub outcome: Outcome,
+    
+    /// Outcome index (0-based) - unified field for all market types
+    /// Binary markets: 0 = YES, 1 = NO (synced with outcome field)
+    /// Multi-outcome markets: 0..N-1
+    pub outcome_index: u8,
     
     /// Order price (e6, e.g., 650000 = $0.65)
     pub price: u64,
@@ -688,8 +699,8 @@ pub struct Order {
     /// This holds the tokens that the seller is offering
     pub escrow_token_account: Option<Pubkey>,
     
-    /// Reserved for future use
-    pub reserved: [u8; 31],
+    /// Reserved for future use (reduced by 1 byte for outcome_index)
+    pub reserved: [u8; 30],
 }
 
 impl Order {
@@ -699,6 +710,7 @@ impl Order {
         + 32  // owner
         + 1   // side
         + 1   // outcome
+        + 1   // outcome_index (NEW)
         + 8   // price
         + 8   // amount
         + 8   // filled_amount
@@ -709,7 +721,7 @@ impl Order {
         + 8   // updated_at
         + 1   // bump
         + 1 + 32 // escrow_token_account (Option<Pubkey>)
-        + 31; // reserved (reduced by 1)
+        + 30; // reserved (reduced by 1 for outcome_index)
     
     /// PDA seeds
     pub fn seeds(market_id: u64, order_id: u64) -> Vec<Vec<u8>> {
@@ -763,6 +775,18 @@ impl Order {
     /// Calculate USDC proceeds for selling tokens at this order's price
     pub fn calculate_proceeds(&self, token_amount: u64) -> u64 {
         self.calculate_cost(token_amount)
+    }
+    
+    /// Get outcome index (unified interface for both binary and multi-outcome markets)
+    /// For binary markets: returns 0 for YES, 1 for NO
+    /// For multi-outcome markets: returns the outcome_index directly
+    pub fn get_outcome_index(&self) -> u8 {
+        self.outcome_index
+    }
+    
+    /// Check if this order is for a binary market (YES/NO)
+    pub fn is_binary_market_order(&self) -> bool {
+        self.outcome_index <= 1
     }
 }
 
@@ -1032,6 +1056,123 @@ impl OracleProposal {
 }
 
 // ============================================================================
+// Authorized Callers Registry
+// ============================================================================
+
+/// Maximum number of authorized callers (matching engines, keepers)
+pub const MAX_AUTHORIZED_CALLERS: usize = 10;
+
+/// Discriminator for AuthorizedCallers PDA
+pub const AUTHORIZED_CALLERS_DISCRIMINATOR: u64 = 0x3141_5926_5358_9793;
+
+/// Authorized callers registry for matching engine access control
+/// 
+/// PDA Seeds: ["authorized_callers"]
+/// 
+/// This structure stores the list of pubkeys authorized to call
+/// matching instructions (MatchMint, MatchBurn, ExecuteTrade, etc.)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct AuthorizedCallers {
+    /// Account discriminator
+    pub discriminator: u64,
+    
+    /// Number of active callers
+    pub count: u8,
+    
+    /// List of authorized caller pubkeys (fixed size array)
+    pub callers: [Pubkey; MAX_AUTHORIZED_CALLERS],
+    
+    /// Creation timestamp
+    pub created_at: i64,
+    
+    /// Last update timestamp
+    pub updated_at: i64,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// Reserved for future use
+    pub reserved: [u8; 32],
+}
+
+impl AuthorizedCallers {
+    /// Calculate size: 8 + 1 + (32 * 10) + 8 + 8 + 1 + 32 = 378 bytes
+    pub const SIZE: usize = 8   // discriminator
+        + 1   // count
+        + 32 * MAX_AUTHORIZED_CALLERS  // callers array (320 bytes)
+        + 8   // created_at
+        + 8   // updated_at
+        + 1   // bump
+        + 32; // reserved
+    
+    /// PDA seeds
+    pub fn seeds() -> Vec<Vec<u8>> {
+        vec![AUTHORIZED_CALLERS_SEED.to_vec()]
+    }
+    
+    /// Create a new empty AuthorizedCallers registry
+    pub fn new(bump: u8, created_at: i64) -> Self {
+        Self {
+            discriminator: AUTHORIZED_CALLERS_DISCRIMINATOR,
+            count: 0,
+            callers: [Pubkey::default(); MAX_AUTHORIZED_CALLERS],
+            created_at,
+            updated_at: created_at,
+            bump,
+            reserved: [0u8; 32],
+        }
+    }
+    
+    /// Check if a pubkey is authorized
+    pub fn is_authorized(&self, caller: &Pubkey) -> bool {
+        for i in 0..(self.count as usize) {
+            if self.callers[i] == *caller {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Add a caller to the list
+    /// Returns Ok(()) if added, Err if already exists or list is full
+    pub fn add_caller(&mut self, caller: Pubkey, current_time: i64) -> Result<(), ()> {
+        // Check if already exists
+        if self.is_authorized(&caller) {
+            return Err(()); // Already authorized
+        }
+        
+        // Check if list is full
+        if (self.count as usize) >= MAX_AUTHORIZED_CALLERS {
+            return Err(()); // List full
+        }
+        
+        // Add to list
+        self.callers[self.count as usize] = caller;
+        self.count += 1;
+        self.updated_at = current_time;
+        
+        Ok(())
+    }
+    
+    /// Remove a caller from the list
+    /// Returns Ok(()) if removed, Err if not found
+    pub fn remove_caller(&mut self, caller: &Pubkey, current_time: i64) -> Result<(), ()> {
+        for i in 0..(self.count as usize) {
+            if self.callers[i] == *caller {
+                // Swap with last element and decrement count
+                let last_idx = (self.count - 1) as usize;
+                self.callers[i] = self.callers[last_idx];
+                self.callers[last_idx] = Pubkey::default();
+                self.count -= 1;
+                self.updated_at = current_time;
+                return Ok(());
+            }
+        }
+        Err(()) // Not found
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1071,6 +1212,48 @@ mod tests {
     }
 
     #[test]
+    fn test_authorized_callers_size() {
+        assert!(AuthorizedCallers::SIZE > 0);
+        println!("AuthorizedCallers SIZE: {}", AuthorizedCallers::SIZE);
+        // Expected: 8 + 1 + 320 + 8 + 8 + 1 + 32 = 378 bytes
+        assert_eq!(AuthorizedCallers::SIZE, 378);
+    }
+
+    #[test]
+    fn test_authorized_callers_operations() {
+        let mut callers = AuthorizedCallers::new(255, 1000);
+        
+        let caller1 = Pubkey::new_unique();
+        let caller2 = Pubkey::new_unique();
+        let caller3 = Pubkey::new_unique();
+        
+        // Test add
+        assert!(callers.add_caller(caller1, 1001).is_ok());
+        assert_eq!(callers.count, 1);
+        assert!(callers.is_authorized(&caller1));
+        assert!(!callers.is_authorized(&caller2));
+        
+        // Test add duplicate (should fail)
+        assert!(callers.add_caller(caller1, 1002).is_err());
+        assert_eq!(callers.count, 1);
+        
+        // Test add second
+        assert!(callers.add_caller(caller2, 1003).is_ok());
+        assert_eq!(callers.count, 2);
+        assert!(callers.is_authorized(&caller1));
+        assert!(callers.is_authorized(&caller2));
+        
+        // Test remove
+        assert!(callers.remove_caller(&caller1, 1004).is_ok());
+        assert_eq!(callers.count, 1);
+        assert!(!callers.is_authorized(&caller1));
+        assert!(callers.is_authorized(&caller2));
+        
+        // Test remove non-existent (should fail)
+        assert!(callers.remove_caller(&caller3, 1005).is_err());
+    }
+
+    #[test]
     fn test_position_add_tokens() {
         let mut position = Position::new(1, Pubkey::new_unique(), 255, 1000);
         
@@ -1095,6 +1278,7 @@ mod tests {
             owner: Pubkey::new_unique(),
             side: OrderSide::Buy,
             outcome: Outcome::Yes,
+            outcome_index: 0,  // YES = 0
             price: 650_000, // $0.65
             amount: 100,
             filled_amount: 0,
@@ -1104,12 +1288,14 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             bump: 255,
-            reserved: [0u8; 32],
+            escrow_token_account: None,
+            reserved: [0u8; 30],
         };
         
-        // Cost of 100 tokens at $0.65 = $65
+        // Cost of 100 tokens at $0.65 = $65 USDC
+        // Formula: 100 * 650_000 / 1_000_000 = 65 USDC tokens
         let cost = order.calculate_cost(100);
-        assert_eq!(cost, 65_000_000);
+        assert_eq!(cost, 65);  // 65 USDC (not e6 format)
     }
 
     #[test]
