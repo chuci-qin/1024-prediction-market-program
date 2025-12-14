@@ -261,10 +261,9 @@ pub struct PredictionMarketConfig {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use (split for Borsh compatibility)
-    pub reserved1: [u8; 32],
-    pub reserved2: [u8; 32],
-    pub reserved3: [u8; 8],
+    /// Reserved for future use
+    /// Note: 64 bytes to match existing on-chain data size (290 total)
+    pub reserved: [u8; 64],
 }
 
 impl PredictionMarketConfig {
@@ -283,9 +282,7 @@ impl PredictionMarketConfig {
         + 8   // proposer_bond_e6
         + 1   // is_paused
         + 1   // bump
-        + 32  // reserved1
-        + 32  // reserved2
-        + 8;  // reserved3 (= 290 total)
+        + 64; // reserved (= 290 total)
     
     /// PDA seeds
     pub fn seeds() -> Vec<Vec<u8>> {
@@ -317,9 +314,7 @@ impl PredictionMarketConfig {
             proposer_bond_e6: DEFAULT_PROPOSER_BOND,
             is_paused: false,
             bump,
-            reserved1: [0u8; 32],
-            reserved2: [0u8; 32],
-            reserved3: [0u8; 8],
+            reserved: [0u8; 64],
         }
     }
 }

@@ -295,10 +295,10 @@ pub enum Outcome {
 }
 
 pub enum OrderType {
-    GTC = 0,    // Good Till Cancel
-    IOC = 1,    // Immediate or Cancel
-    FOK = 2,    // Fill or Kill
-    GTD = 3,    // Good Till Date
+    GTC = 0,    // Good Till Cancel - 持续有效直到成交或取消
+    GTD = 1,    // Good Till Date - 在指定时间前有效
+    IOC = 2,    // Immediate Or Cancel - 立即成交，剩余取消
+    FOK = 3,    // Fill Or Kill - 完全成交或完全取消
 }
 ```
 

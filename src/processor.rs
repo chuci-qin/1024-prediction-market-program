@@ -31,6 +31,11 @@ use crate::utils::{
     validate_price, validate_price_pair,
     deserialize_account,
 };
+use crate::cpi::{
+    cpi_lock_for_prediction,
+    cpi_release_from_prediction,
+    cpi_prediction_settle,
+};
 
 /// Process an instruction
 pub fn process_instruction(
@@ -45,6 +50,10 @@ pub fn process_instruction(
         PredictionMarketInstruction::Initialize(args) => {
             msg!("Instruction: Initialize");
             process_initialize(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ReinitializeConfig(args) => {
+            msg!("Instruction: ReinitializeConfig");
+            process_reinitialize_config(program_id, accounts, args)
         }
         
         // === Market Management ===
@@ -244,6 +253,28 @@ pub fn process_instruction(
             msg!("Instruction: RelayerMatchBurnMulti");
             process_relayer_match_burn_multi(program_id, accounts, args)
         }
+        
+        // === V2 Instructions (Pure Vault Mode) ===
+        PredictionMarketInstruction::RelayerMintCompleteSetV2(args) => {
+            msg!("Instruction: RelayerMintCompleteSetV2");
+            process_relayer_mint_complete_set_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRedeemCompleteSetV2(args) => {
+            msg!("Instruction: RelayerRedeemCompleteSetV2");
+            process_relayer_redeem_complete_set_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::MatchMintV2(args) => {
+            msg!("Instruction: MatchMintV2");
+            process_match_mint_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::MatchBurnV2(args) => {
+            msg!("Instruction: MatchBurnV2");
+            process_match_burn_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerClaimWinningsV2(args) => {
+            msg!("Instruction: RelayerClaimWinningsV2");
+            process_relayer_claim_winnings_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -347,6 +378,93 @@ fn process_initialize(
     msg!("Oracle Admin: {}", args.oracle_admin);
     msg!("Challenge Window: {} seconds", args.challenge_window_secs);
     msg!("Proposer Bond: {} (e6)", args.proposer_bond_e6);
+    
+    Ok(())
+}
+
+/// Reinitialize config - allows admin to reset config data for migration/upgrade
+fn process_reinitialize_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ReinitializeConfigArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig PDA (writable)
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: USDC Mint
+    let usdc_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: Fund Program
+    let fund_program_info = next_account_info(account_info_iter)?;
+    
+    // Verify config PDA
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        msg!("Error: Invalid PredictionMarketConfig PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Config must exist (this is reinitialize, not initialize)
+    if config_info.data_is_empty() {
+        msg!("Error: Config not initialized, use Initialize instead");
+        return Err(PredictionMarketError::AccountNotInitialized.into());
+    }
+    
+    // Load existing config to verify admin
+    let existing_config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    // Verify caller is current admin
+    if existing_config.admin != *admin_info.key {
+        msg!("Error: Only admin can reinitialize config");
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Create new config data
+    let mut new_config = PredictionMarketConfig::new(
+        *admin_info.key,
+        *usdc_mint_info.key,
+        *vault_program_info.key,
+        *fund_program_info.key,
+        args.oracle_admin,
+        config_bump,
+    );
+    
+    // Apply custom settings
+    new_config.challenge_window_secs = args.challenge_window_secs;
+    new_config.proposer_bond_e6 = args.proposer_bond_e6;
+    
+    // Preserve or reset counters based on args
+    if !args.reset_counters {
+        new_config.next_market_id = existing_config.next_market_id;
+        new_config.total_markets = existing_config.total_markets;
+        new_config.active_markets = existing_config.active_markets;
+        new_config.total_volume_e6 = existing_config.total_volume_e6;
+        new_config.total_minted_sets = existing_config.total_minted_sets;
+    }
+    
+    // Serialize and save
+    new_config.serialize(&mut *config_info.data.borrow_mut())?;
+    
+    msg!("PredictionMarketConfig reinitialized successfully");
+    msg!("Admin: {}", admin_info.key);
+    msg!("USDC Mint: {}", usdc_mint_info.key);
+    msg!("Vault Program: {}", vault_program_info.key);
+    msg!("Fund Program: {}", fund_program_info.key);
+    msg!("Oracle Admin: {}", args.oracle_admin);
+    msg!("Reset Counters: {}", args.reset_counters);
     
     Ok(())
 }
@@ -4059,6 +4177,9 @@ fn process_place_multi_outcome_order(
     
     let account_info_iter = &mut accounts.iter();
     
+    // Determine if this is a sell order (need to know early for account parsing)
+    let is_sell_order = args.side == OrderSide::Sell;
+    
     // Account 0: User (signer)
     let user_info = next_account_info(account_info_iter)?;
     check_signer(user_info)?;
@@ -4076,16 +4197,24 @@ fn process_place_multi_outcome_order(
     let _position_info = next_account_info(account_info_iter)?;
     
     // Account 5: Outcome Mint
-    let _outcome_mint_info = next_account_info(account_info_iter)?;
+    let outcome_mint_info = next_account_info(account_info_iter)?;
     
     // Account 6: User Outcome Token Account
-    let _user_outcome_token_info = next_account_info(account_info_iter)?;
+    let user_token_info = next_account_info(account_info_iter)?;
     
-    // Account 7: Token Program
-    let _token_program_info = next_account_info(account_info_iter)?;
-    
-    // Account 8: System Program
-    let system_program_info = next_account_info(account_info_iter)?;
+    // For Sell orders: Account 7 is Escrow, 8 is Token Program, 9 is System, 10 is Rent
+    // For Buy orders: Account 7 is Token Program, 8 is System Program
+    let (escrow_token_info, token_program_info, system_program_info, rent_sysvar_info) = if is_sell_order {
+        let escrow = next_account_info(account_info_iter)?;
+        let token_prog = next_account_info(account_info_iter)?;
+        let sys_prog = next_account_info(account_info_iter)?;
+        let rent = next_account_info(account_info_iter)?;
+        (Some(escrow), token_prog, sys_prog, Some(rent))
+    } else {
+        let token_prog = next_account_info(account_info_iter)?;
+        let sys_prog = next_account_info(account_info_iter)?;
+        (None, token_prog, sys_prog, None)
+    };
     
     // Load and validate config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -4160,6 +4289,90 @@ fn process_place_multi_outcome_order(
         &[order_seeds],
     )?;
     
+    // ========== Handle Sell Order Escrow ==========
+    let escrow_token_account: Option<Pubkey> = if is_sell_order {
+        let escrow_info = escrow_token_info.expect("Escrow account required for sell order");
+        let rent_info = rent_sysvar_info.expect("Rent sysvar required for sell order");
+        
+        // Verify Outcome Mint matches the outcome_index
+        let (expected_mint, _) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &[args.outcome_index]],
+            program_id,
+        );
+        if *outcome_mint_info.key != expected_mint {
+            msg!("Error: Outcome mint does not match outcome_index {}", args.outcome_index);
+            return Err(PredictionMarketError::InvalidTokenMint.into());
+        }
+        
+        // Derive and verify Escrow PDA
+        let (escrow_pda, escrow_bump) = Pubkey::find_program_address(
+            &[ORDER_ESCROW_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *escrow_info.key != escrow_pda {
+            msg!("Error: Invalid escrow PDA");
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Create Escrow Token Account
+        let escrow_rent = Rent::from_account_info(rent_info)?;
+        let escrow_space = spl_token::state::Account::LEN;
+        let escrow_lamports = escrow_rent.minimum_balance(escrow_space);
+        let escrow_seeds: &[&[u8]] = &[
+            ORDER_ESCROW_SEED, 
+            &market_id_bytes, 
+            &order_id_bytes, 
+            &[escrow_bump]
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                user_info.key,
+                escrow_info.key,
+                escrow_lamports,
+                escrow_space as u64,
+                &spl_token::id(),
+            ),
+            &[user_info.clone(), escrow_info.clone(), system_program_info.clone()],
+            &[escrow_seeds],
+        )?;
+        
+        // Initialize Escrow Token Account (Order PDA as owner)
+        invoke(
+            &spl_token::instruction::initialize_account3(
+                token_program_info.key,
+                escrow_info.key,
+                outcome_mint_info.key,
+                order_info.key,  // Order PDA is the owner for escrow
+            )?,
+            &[escrow_info.clone(), outcome_mint_info.clone()],
+        )?;
+        
+        // Transfer tokens from User to Escrow
+        invoke(
+            &spl_token::instruction::transfer(
+                token_program_info.key,
+                user_token_info.key,
+                escrow_info.key,
+                user_info.key,
+                &[],
+                args.amount,
+            )?,
+            &[
+                user_token_info.clone(), 
+                escrow_info.clone(), 
+                user_info.clone(), 
+                token_program_info.clone()
+            ],
+        )?;
+        
+        msg!("🔒 Multi-outcome sell order: {} tokens locked in escrow", args.amount);
+        msg!("   Escrow PDA: {}", escrow_pda);
+        Some(escrow_pda)
+    } else {
+        None
+    };
+    
     // Map outcome_index to Outcome enum (for compatibility)
     let outcome = if args.outcome_index == 0 { Outcome::Yes } else { Outcome::No };
     
@@ -4181,7 +4394,7 @@ fn process_place_multi_outcome_order(
         created_at: current_time,
         updated_at: current_time,
         bump: order_bump,
-        escrow_token_account: None,
+        escrow_token_account,  // ✅ Now properly set for Sell orders
         reserved: [0u8; 30],
     };
     
@@ -4192,13 +4405,16 @@ fn process_place_multi_outcome_order(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
-    msg!("Multi-outcome order placed");
-    msg!("Market ID: {}", args.market_id);
-    msg!("Order ID: {}", order_id);
-    msg!("Outcome Index: {}", args.outcome_index);
-    msg!("Side: {:?}", args.side);
-    msg!("Price: {}", args.price);
-    msg!("Amount: {}", args.amount);
+    msg!("✅ Multi-outcome order placed");
+    msg!("   Market ID: {}", args.market_id);
+    msg!("   Order ID: {}", order_id);
+    msg!("   Outcome Index: {}", args.outcome_index);
+    msg!("   Side: {:?}", args.side);
+    msg!("   Price: {} (e6)", args.price);
+    msg!("   Amount: {}", args.amount);
+    if escrow_token_account.is_some() {
+        msg!("   Escrow: Yes");
+    }
     
     Ok(())
 }
@@ -5795,5 +6011,889 @@ fn verify_authorized_caller_with_registry(
     
     msg!("Unauthorized caller: {}", caller);
     Err(PredictionMarketError::Unauthorized.into())
+}
+
+// ============================================================================
+// V2 Processors - Pure Vault Mode (No SPL Token)
+// ============================================================================
+
+/// V2: RelayerMintCompleteSet using Vault CPI (no SPL Token)
+/// 
+/// This function:
+/// 1. Validates relayer and market
+/// 2. Calls Vault.PredictionMarketLock to move funds from user's available_balance to pm_locked
+/// 3. Creates or updates Position PDA with virtual YES/NO amounts
+/// 4. Updates Market.total_minted
+fn process_relayer_mint_complete_set_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMintCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Vault Account (writable)
+    let user_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PM User Account (writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify Relayer authority
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: CPI to Vault - PredictionMarketLock
+    // Also passes relayer (payer) and system_program for auto-init of PMUserAccount
+    msg!("CPI: Vault.PredictionMarketLock amount={}", args.amount);
+    cpi_lock_for_prediction(
+        vault_program_info,
+        vault_config_info,
+        user_vault_info,
+        pm_user_account_info,
+        config_info,  // PM Config as caller program marker
+        relayer_info, // Payer for auto-init
+        system_program_info, // System program for auto-init
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Create or update Position PDA
+    let (position_pda, position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let is_new_position = position_info.data_is_empty();
+    
+    if is_new_position {
+        // Create new Position account
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            POSITION_SEED, 
+            &market_id_bytes, 
+            args.user_wallet.as_ref(), 
+            &[position_bump]
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+    }
+    
+    // Get mutable access to position data
+    // For newly created accounts, we initialize; for existing, we update
+    let mut position_data = position_info.try_borrow_mut_data()?;
+    
+    let mut position = if is_new_position {
+        // Initialize new position
+        Position::new(market.market_id, args.user_wallet, position_bump, current_time)
+    } else {
+        // Deserialize existing position
+        let pos = Position::deserialize(&mut &position_data[..])?;
+        if pos.discriminator != POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        pos
+    };
+    
+    // MintCompleteSet: add same amount to both YES and NO
+    // avg_cost = 500_000 (0.5 USDC) because 1 USDC = 1 YES + 1 NO
+    position.yes_amount = safe_add_u64(position.yes_amount, args.amount)?;
+    position.no_amount = safe_add_u64(position.no_amount, args.amount)?;
+    position.yes_avg_cost = 500_000;  // 0.5 USDC per token
+    position.no_avg_cost = 500_000;   // 0.5 USDC per token
+    position.total_cost_e6 = safe_add_u64(position.total_cost_e6, args.amount)?;  // Total USDC spent
+    position.updated_at = current_time;
+    
+    // Serialize directly to the account data slice
+    position.serialize(&mut position_data.as_mut())?;
+    drop(position_data); // Release mutable borrow
+    
+    // Step 3: Update Market
+    market.total_minted = safe_add_u64(market.total_minted, args.amount)?;
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerMintCompleteSetV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Amount: {}", args.amount);
+    msg!("Position YES: {}, NO: {}", position.yes_amount, position.no_amount);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: RelayerRedeemCompleteSet using Vault CPI (no SPL Token)
+/// 
+/// This function:
+/// 1. Validates relayer, market, and position
+/// 2. Verifies user has sufficient YES and NO virtual tokens
+/// 3. Calls Vault.PredictionMarketUnlock to move funds from pm_locked to available_balance
+/// 4. Updates Position PDA by reducing YES/NO amounts
+/// 5. Updates Market.total_minted
+fn process_relayer_redeem_complete_set_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRedeemCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Vault Account (writable)
+    let user_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PM User Account (writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Verify Position PDA
+    let (position_pda, _position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and validate Position
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify user has sufficient tokens
+    if position.yes_amount < args.amount || position.no_amount < args.amount {
+        msg!("Insufficient position: YES={}, NO={}, requested={}", 
+             position.yes_amount, position.no_amount, args.amount);
+        return Err(PredictionMarketError::InsufficientPosition.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: CPI to Vault - PredictionMarketUnlock
+    msg!("CPI: Vault.PredictionMarketUnlock amount={}", args.amount);
+    cpi_release_from_prediction(
+        vault_program_info,
+        vault_config_info,
+        user_vault_info,
+        pm_user_account_info,
+        config_info,
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Update Position - reduce YES and NO amounts
+    position.yes_amount = position.yes_amount.saturating_sub(args.amount);
+    position.no_amount = position.no_amount.saturating_sub(args.amount);
+    position.updated_at = current_time;
+    
+    position.serialize(&mut *position_info.data.borrow_mut())?;
+    
+    // Step 3: Update Market
+    market.total_minted = market.total_minted.saturating_sub(args.amount);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerRedeemCompleteSetV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Amount: {}", args.amount);
+    msg!("Position YES: {}, NO: {}", position.yes_amount, position.no_amount);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: MatchMint using Vault CPI (no SPL Token)
+/// 
+/// Matches a YES buy order with a NO buy order via minting.
+/// Both buyers lock funds, and receive virtual tokens in their positions.
+fn process_match_mint_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchMintArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer/Matcher (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: YES Buy Order (writable)
+    let yes_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: NO Buy Order (writable)
+    let no_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: YES Buyer Position (writable)
+    let yes_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: NO Buyer Position (writable)
+    let no_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: YES Buyer Vault Account (writable)
+    let yes_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: YES Buyer PM User Account (writable)
+    let yes_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: NO Buyer Vault Account (writable)
+    let no_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: NO Buyer PM User Account (writable)
+    let no_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 12: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 13: System Program (for auto-init PMUserAccount)
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Validate price pair for minting: yes_price + no_price <= 1.0
+    if args.yes_price + args.no_price > PRICE_PRECISION {
+        msg!("Price sum {} + {} > 1.0, not valid for minting", args.yes_price, args.no_price);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    // Load orders and validate
+    let mut yes_order = deserialize_account::<Order>(&yes_order_info.data.borrow())?;
+    let mut no_order = deserialize_account::<Order>(&no_order_info.data.borrow())?;
+    
+    if yes_order.discriminator != ORDER_DISCRIMINATOR || no_order.discriminator != ORDER_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify orders are Buy orders
+    if yes_order.side != crate::state::OrderSide::Buy || no_order.side != crate::state::OrderSide::Buy {
+        return Err(PredictionMarketError::InvalidOrderSide.into());
+    }
+    
+    // Verify outcomes
+    if yes_order.outcome != Outcome::Yes || no_order.outcome != Outcome::No {
+        return Err(PredictionMarketError::InvalidOutcome.into());
+    }
+    
+    // Verify orders are active
+    if !yes_order.is_active() || !no_order.is_active() {
+        return Err(PredictionMarketError::OrderNotActive.into());
+    }
+    
+    // Calculate match amount
+    let yes_remaining = yes_order.remaining_amount();
+    let no_remaining = no_order.remaining_amount();
+    let match_amount = args.amount.min(yes_remaining).min(no_remaining);
+    
+    if match_amount == 0 {
+        return Err(PredictionMarketError::NoMatchableAmount.into());
+    }
+    
+    // Calculate costs
+    let yes_cost = (match_amount as u128 * args.yes_price as u128 / PRICE_PRECISION as u128) as u64;
+    let no_cost = (match_amount as u128 * args.no_price as u128 / PRICE_PRECISION as u128) as u64;
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: Lock funds for YES buyer
+    msg!("CPI: Lock {} for YES buyer", yes_cost);
+    cpi_lock_for_prediction(
+        vault_program_info,
+        vault_config_info,
+        yes_vault_info,
+        yes_pm_user_info,
+        config_info,
+        relayer_info,       // Payer for auto-init
+        system_program_info, // System program for auto-init
+        yes_cost,
+        config_seeds,
+    )?;
+    
+    // Step 2: Lock funds for NO buyer
+    msg!("CPI: Lock {} for NO buyer", no_cost);
+    cpi_lock_for_prediction(
+        vault_program_info,
+        vault_config_info,
+        no_vault_info,
+        no_pm_user_info,
+        config_info,
+        relayer_info,       // Payer for auto-init
+        system_program_info, // System program for auto-init
+        no_cost,
+        config_seeds,
+    )?;
+    
+    // Step 3: Update YES buyer position
+    let mut yes_position = deserialize_account::<Position>(&yes_position_info.data.borrow())?;
+    yes_position.add_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
+    yes_position.serialize(&mut *yes_position_info.data.borrow_mut())?;
+    
+    // Step 4: Update NO buyer position
+    let mut no_position = deserialize_account::<Position>(&no_position_info.data.borrow())?;
+    no_position.add_tokens(Outcome::No, match_amount, args.no_price, current_time);
+    no_position.serialize(&mut *no_position_info.data.borrow_mut())?;
+    
+    // Step 5: Update orders
+    yes_order.filled_amount = safe_add_u64(yes_order.filled_amount, match_amount)?;
+    if yes_order.filled_amount >= yes_order.amount {
+        yes_order.status = OrderStatus::Filled;
+    } else {
+        yes_order.status = OrderStatus::PartialFilled;
+    }
+    yes_order.updated_at = current_time;
+    yes_order.serialize(&mut *yes_order_info.data.borrow_mut())?;
+    
+    no_order.filled_amount = safe_add_u64(no_order.filled_amount, match_amount)?;
+    if no_order.filled_amount >= no_order.amount {
+        no_order.status = OrderStatus::Filled;
+    } else {
+        no_order.status = OrderStatus::PartialFilled;
+    }
+    no_order.updated_at = current_time;
+    no_order.serialize(&mut *no_order_info.data.borrow_mut())?;
+    
+    // Step 6: Update market
+    market.total_minted = safe_add_u64(market.total_minted, match_amount)?;
+    market.total_volume_e6 = market.total_volume_e6.saturating_add((yes_cost + no_cost) as i64);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ MatchMintV2 completed");
+    msg!("Amount: {}", match_amount);
+    msg!("YES cost: {}, NO cost: {}", yes_cost, no_cost);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: MatchBurn using Vault CPI (no SPL Token)
+/// 
+/// Matches a YES sell order with a NO sell order via burning.
+/// Both sellers receive funds from their locked amounts.
+fn process_match_burn_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchBurnArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer/Matcher (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: YES Sell Order (writable)
+    let yes_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: NO Sell Order (writable)
+    let no_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: YES Seller Position (writable)
+    let yes_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: NO Seller Position (writable)
+    let no_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: YES Seller Vault Account (writable)
+    let yes_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: YES Seller PM User Account (writable)
+    let yes_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: NO Seller Vault Account (writable)
+    let no_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: NO Seller PM User Account (writable)
+    let no_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 12: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Validate price pair for burning: yes_price + no_price >= 1.0
+    if args.yes_price + args.no_price < PRICE_PRECISION {
+        msg!("Price sum {} + {} < 1.0, not valid for burning", args.yes_price, args.no_price);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    // Load orders
+    let mut yes_order = deserialize_account::<Order>(&yes_order_info.data.borrow())?;
+    let mut no_order = deserialize_account::<Order>(&no_order_info.data.borrow())?;
+    
+    // Verify orders are Sell orders
+    if yes_order.side != crate::state::OrderSide::Sell || no_order.side != crate::state::OrderSide::Sell {
+        return Err(PredictionMarketError::InvalidOrderSide.into());
+    }
+    
+    // Verify outcomes
+    if yes_order.outcome != Outcome::Yes || no_order.outcome != Outcome::No {
+        return Err(PredictionMarketError::InvalidOutcome.into());
+    }
+    
+    // Verify orders are active
+    if !yes_order.is_active() || !no_order.is_active() {
+        return Err(PredictionMarketError::OrderNotActive.into());
+    }
+    
+    // Calculate match amount
+    let yes_remaining = yes_order.remaining_amount();
+    let no_remaining = no_order.remaining_amount();
+    let match_amount = args.amount.min(yes_remaining).min(no_remaining);
+    
+    if match_amount == 0 {
+        return Err(PredictionMarketError::NoMatchableAmount.into());
+    }
+    
+    // Calculate proceeds
+    let yes_proceeds = (match_amount as u128 * args.yes_price as u128 / PRICE_PRECISION as u128) as u64;
+    let no_proceeds = (match_amount as u128 * args.no_price as u128 / PRICE_PRECISION as u128) as u64;
+    
+    // Load positions
+    let mut yes_position = deserialize_account::<Position>(&yes_position_info.data.borrow())?;
+    let mut no_position = deserialize_account::<Position>(&no_position_info.data.borrow())?;
+    
+    // Verify sellers have sufficient position
+    if yes_position.yes_amount < match_amount {
+        return Err(PredictionMarketError::InsufficientPosition.into());
+    }
+    if no_position.no_amount < match_amount {
+        return Err(PredictionMarketError::InsufficientPosition.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: Release funds for YES seller
+    msg!("CPI: Release {} for YES seller", yes_proceeds);
+    cpi_release_from_prediction(
+        vault_program_info,
+        vault_config_info,
+        yes_vault_info,
+        yes_pm_user_info,
+        config_info,
+        yes_proceeds,
+        config_seeds,
+    )?;
+    
+    // Step 2: Release funds for NO seller
+    msg!("CPI: Release {} for NO seller", no_proceeds);
+    cpi_release_from_prediction(
+        vault_program_info,
+        vault_config_info,
+        no_vault_info,
+        no_pm_user_info,
+        config_info,
+        no_proceeds,
+        config_seeds,
+    )?;
+    
+    // Step 3: Update positions
+    yes_position.remove_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
+    yes_position.serialize(&mut *yes_position_info.data.borrow_mut())?;
+    
+    no_position.remove_tokens(Outcome::No, match_amount, args.no_price, current_time);
+    no_position.serialize(&mut *no_position_info.data.borrow_mut())?;
+    
+    // Step 4: Update orders
+    yes_order.filled_amount = safe_add_u64(yes_order.filled_amount, match_amount)?;
+    if yes_order.filled_amount >= yes_order.amount {
+        yes_order.status = OrderStatus::Filled;
+    } else {
+        yes_order.status = OrderStatus::PartialFilled;
+    }
+    yes_order.updated_at = current_time;
+    yes_order.serialize(&mut *yes_order_info.data.borrow_mut())?;
+    
+    no_order.filled_amount = safe_add_u64(no_order.filled_amount, match_amount)?;
+    if no_order.filled_amount >= no_order.amount {
+        no_order.status = OrderStatus::Filled;
+    } else {
+        no_order.status = OrderStatus::PartialFilled;
+    }
+    no_order.updated_at = current_time;
+    no_order.serialize(&mut *no_order_info.data.borrow_mut())?;
+    
+    // Step 5: Update market
+    market.total_minted = market.total_minted.saturating_sub(match_amount);
+    market.total_volume_e6 = market.total_volume_e6.saturating_add((yes_proceeds + no_proceeds) as i64);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ MatchBurnV2 completed");
+    msg!("Amount: {}", match_amount);
+    msg!("YES proceeds: {}, NO proceeds: {}", yes_proceeds, no_proceeds);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: RelayerClaimWinnings using Vault CPI (no SPL Token)
+/// 
+/// This function:
+/// 1. Validates market is resolved
+/// 2. Calculates settlement based on winning outcome and position
+/// 3. Calls Vault.PredictionMarketSettle to settle funds
+/// 4. Marks position as settled
+fn process_relayer_claim_winnings_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerClaimWinningsArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: PM User Account (writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Load and validate market
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if market.status != MarketStatus::Resolved {
+        return Err(PredictionMarketError::MarketNotResolved.into());
+    }
+    
+    let final_result = market.final_result.ok_or(PredictionMarketError::MarketNotResolved)?;
+    
+    let market_id_bytes = market.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Verify Position PDA
+    let (position_pda, _position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and validate Position
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if position.settled {
+        return Err(PredictionMarketError::AlreadySettled.into());
+    }
+    
+    // Calculate settlement amount based on result
+    let (winning_amount, locked_amount) = match final_result {
+        MarketResult::Yes => (position.yes_amount, position.total_cost_e6),
+        MarketResult::No => (position.no_amount, position.total_cost_e6),
+        MarketResult::Invalid => {
+            // Refund original cost
+            (0, position.total_cost_e6)
+        }
+    };
+    
+    let settlement_amount = if final_result == MarketResult::Invalid {
+        // Full refund on invalid market
+        locked_amount
+    } else {
+        // Winning tokens pay out 1:1
+        winning_amount
+    };
+    
+    if settlement_amount == 0 && winning_amount == 0 {
+        msg!("No winnings to claim for user {}", args.user_wallet);
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // CPI to Vault - PredictionMarketSettle
+    msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
+         locked_amount, settlement_amount);
+    cpi_prediction_settle(
+        vault_program_info,
+        vault_config_info,
+        pm_user_account_info,
+        config_info,
+        locked_amount,
+        settlement_amount,
+        config_seeds,
+    )?;
+    
+    // Update Position
+    let pnl = (settlement_amount as i64) - (locked_amount as i64);
+    position.realized_pnl = position.realized_pnl.saturating_add(pnl);
+    position.settlement_amount = settlement_amount;
+    position.settled = true;
+    position.yes_amount = 0;
+    position.no_amount = 0;
+    position.updated_at = current_time;
+    
+    position.serialize(&mut *position_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerClaimWinningsV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Result: {:?}", final_result);
+    msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
+    
+    Ok(())
 }
 

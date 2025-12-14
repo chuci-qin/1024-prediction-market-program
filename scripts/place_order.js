@@ -22,7 +22,8 @@ const {
 const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, ASSOCIATED_TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const fs = require('fs');
 
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
 
 // Seeds
 const PM_CONFIG_SEED = Buffer.from('pm_config');
@@ -101,7 +102,10 @@ async function main() {
   console.log(`Price: $${priceArg} (${priceE6} e6)`);
   console.log(`Amount: ${amountArg / 1_000_000} tokens`);
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(RPC_URL, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000,
+  });
   
   const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));

@@ -5,7 +5,8 @@
 
 const { Connection, PublicKey } = require('@solana/web3.js');
 
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
 const PM_CONFIG_SEED = Buffer.from('pm_config');
 const MARKET_SEED = Buffer.from('market');
 
@@ -18,8 +19,9 @@ async function main() {
   console.log('='.repeat(60));
   console.log(`1024 Prediction Market - Query Market ${marketId}`);
   console.log('='.repeat(60));
+  console.log(`Program ID: ${PROGRAM_ID.toBase58()}`);
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(RPC_URL, 'confirmed');
   
   // Query Config
   const [configPda] = PublicKey.findProgramAddressSync([PM_CONFIG_SEED], PROGRAM_ID);

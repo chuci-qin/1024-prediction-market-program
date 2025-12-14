@@ -4,15 +4,18 @@
 
 const { Connection, PublicKey } = require('@solana/web3.js');
 
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+// 新的 Program ID (V3 - 2025-12-12)
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
 const PM_CONFIG_SEED = Buffer.from('pm_config');
+const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
 
 async function main() {
   console.log('='.repeat(60));
   console.log('1024 Prediction Market - Query Config');
   console.log('='.repeat(60));
+  console.log(`Program ID: ${PROGRAM_ID.toBase58()}`);
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(RPC_URL, 'confirmed');
   
   const [configPda] = PublicKey.findProgramAddressSync([PM_CONFIG_SEED], PROGRAM_ID);
   console.log(`Config PDA: ${configPda.toBase58()}`);

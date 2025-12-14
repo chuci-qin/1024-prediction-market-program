@@ -23,6 +23,19 @@ pub enum PredictionMarketInstruction {
     /// 5. `[]` System Program
     Initialize(InitializeArgs),
     
+    /// Reinitialize the config (Admin only, for migration/upgrade)
+    /// 
+    /// This allows resetting the config data while preserving the account.
+    /// Only callable by the current admin.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` PredictionMarketConfig PDA
+    /// 2. `[]` USDC Mint
+    /// 3. `[]` Vault Program
+    /// 4. `[]` Fund Program
+    ReinitializeConfig(ReinitializeConfigArgs),
+    
     // =========================================================================
     // Market Management (10-29)
     // =========================================================================
@@ -414,17 +427,26 @@ pub enum PredictionMarketInstruction {
     
     /// Place an order for a specific outcome in multi-outcome market
     /// 
-    /// Accounts:
-    /// 0. `[signer]` User
-    /// 1. `[]` PredictionMarketConfig
-    /// 2. `[writable]` Market
-    /// 3. `[writable]` Order PDA
-    /// 4. `[writable]` User Position PDA
-    /// 5. `[writable]` Outcome Token Mint
-    /// 6. `[writable]` User's Outcome Token Account (for sell orders)
-    /// 7. `[writable]` Escrow Token Account (for sell orders)
-    /// 8. `[]` Token Program
-    /// 9. `[]` System Program
+    /// Account Layout (unified for Buy and Sell):
+    /// 
+    /// | Index | Account                    | Buy Order | Sell Order |
+    /// |-------|----------------------------|-----------|------------|
+    /// | 0     | `[signer]` User            | Required  | Required   |
+    /// | 1     | `[]` PredictionMarketConfig| Required  | Required   |
+    /// | 2     | `[writable]` Market        | Required  | Required   |
+    /// | 3     | `[writable]` Order PDA     | Required  | Required   |
+    /// | 4     | `[writable]` User Position | Required  | Required   |
+    /// | 5     | `[]` Outcome Token Mint    | Required  | `[writable]` |
+    /// | 6     | `[]` User Token Account    | Required  | `[writable]` (source) |
+    /// | 7     | `[]` Token Program         | Required  | - |
+    /// | 8     | `[]` System Program        | Required  | - |
+    /// | 7     | `[writable]` Escrow PDA    | -         | Required (destination) |
+    /// | 8     | `[]` Token Program         | -         | Required   |
+    /// | 9     | `[]` System Program        | -         | Required   |
+    /// | 10    | `[]` Rent Sysvar           | -         | Required   |
+    /// 
+    /// For Sell orders, tokens are transferred from User Token Account to Escrow.
+    /// Escrow PDA = [b"order_escrow", market_id, order_id]
     PlaceMultiOutcomeOrder(PlaceMultiOutcomeOrderArgs),
     
     /// Propose result for multi-outcome market
@@ -546,6 +568,69 @@ pub enum PredictionMarketInstruction {
     
     /// Relayer version of MatchBurnMulti
     RelayerMatchBurnMulti(RelayerMatchBurnMultiArgs),
+    
+    // =========================================================================
+    // V2 Instructions - Pure Vault Mode (260-279)
+    // NO SPL Token (YES/NO Mints), positions tracked in Position PDA
+    // =========================================================================
+    
+    /// V2: RelayerMintCompleteSet (Vault CPI, no SPL Token)
+    /// Uses Vault.PredictionMarketLock instead of SPL Token minting
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Position PDA
+    /// 4. `[writable]` User Vault Account
+    /// 5. `[writable]` PM User Account
+    /// 6. `[]` Vault Config
+    /// 7. `[]` Vault Program
+    /// 8. `[]` System Program
+    RelayerMintCompleteSetV2(RelayerMintCompleteSetArgs),
+    
+    /// V2: RelayerRedeemCompleteSet (Vault CPI, no SPL Token)
+    /// Uses Vault.PredictionMarketUnlock instead of SPL Token burning
+    /// 
+    /// Accounts: (same as RelayerMintCompleteSetV2)
+    RelayerRedeemCompleteSetV2(RelayerRedeemCompleteSetArgs),
+    
+    /// V2: MatchMint (Vault CPI, no SPL Token)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer/Matcher
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` YES Buy Order
+    /// 4. `[writable]` NO Buy Order
+    /// 5. `[writable]` YES Buyer Position
+    /// 6. `[writable]` NO Buyer Position
+    /// 7. `[writable]` YES Buyer Vault Account
+    /// 8. `[writable]` YES Buyer PM User Account
+    /// 9. `[writable]` NO Buyer Vault Account
+    /// 10. `[writable]` NO Buyer PM User Account
+    /// 11. `[]` Vault Config
+    /// 12. `[]` Vault Program
+    /// 13. `[]` System Program
+    MatchMintV2(MatchMintArgs),
+    
+    /// V2: MatchBurn (Vault CPI, no SPL Token)
+    /// 
+    /// Accounts: (same as MatchMintV2)
+    MatchBurnV2(MatchBurnArgs),
+    
+    /// V2: RelayerClaimWinnings (Vault CPI, no SPL Token)
+    /// Uses Vault.PredictionMarketSettle for settlement
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market
+    /// 3. `[writable]` Position PDA
+    /// 4. `[writable]` PM User Account
+    /// 5. `[]` Vault Config
+    /// 6. `[]` Vault Program
+    RelayerClaimWinningsV2(RelayerClaimWinningsArgs),
 }
 
 // ============================================================================
@@ -562,6 +647,19 @@ pub struct InitializeArgs {
     pub challenge_window_secs: i64,
     /// Proposer bond amount (e6)
     pub proposer_bond_e6: u64,
+}
+
+/// Arguments for ReinitializeConfig
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ReinitializeConfigArgs {
+    /// New oracle admin pubkey
+    pub oracle_admin: Pubkey,
+    /// Challenge window in seconds
+    pub challenge_window_secs: i64,
+    /// Proposer bond amount (e6)
+    pub proposer_bond_e6: u64,
+    /// Reset market counters (if true, resets next_market_id, total_markets, etc.)
+    pub reset_counters: bool,
 }
 
 // === Market Management ===

@@ -23,6 +23,7 @@ use crate::error::PredictionMarketError;
 /// Lock user funds for prediction market (CPI to Vault Program)
 /// 
 /// This moves USDC from available_balance to pm_locked in the user's Vault account.
+/// If PMUserAccount doesn't exist, it will be auto-initialized (requires payer and system_program).
 /// 
 /// Vault Instruction Index: 16 (PredictionMarketLock)
 pub fn cpi_lock_for_prediction<'a>(
@@ -31,6 +32,8 @@ pub fn cpi_lock_for_prediction<'a>(
     user_account: &AccountInfo<'a>,
     pm_user_account: &AccountInfo<'a>,
     caller_program: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
@@ -40,11 +43,14 @@ pub fn cpi_lock_for_prediction<'a>(
     let mut data = vec![16u8];
     data.extend_from_slice(&amount.to_le_bytes());
     
+    // Include payer and system_program for auto-init if pm_user_account is empty
     let accounts = vec![
         vault_config.clone(),
         user_account.clone(),
         pm_user_account.clone(),
         caller_program.clone(),
+        payer.clone(),          // Payer for auto-init
+        system_program.clone(), // System program for auto-init
     ];
     
     let ix = solana_program::instruction::Instruction {
