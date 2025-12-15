@@ -656,6 +656,46 @@ pub enum PredictionMarketInstruction {
     /// 12. `[]` Vault Program
     /// 13. `[]` System Program
     ExecuteTradeV2(ExecuteTradeArgs),
+    
+    /// V2: MatchMintMulti (Vault CPI, no SPL Token)
+    /// Multi-outcome Complete Set Mint using Vault accounting
+    /// 
+    /// When sum of all outcome buy prices <= 1.0, mint virtual tokens
+    /// and lock buyer funds via Vault CPI.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer/Matcher
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[]` VaultConfig
+    /// 4. `[]` Vault Program
+    /// 5. `[]` System Program
+    /// Dynamic accounts (4 per outcome, for i in 0..num_outcomes):
+    ///   6 + 4*i + 0: `[writable]` Order PDA
+    ///   6 + 4*i + 1: `[writable]` Buyer MultiOutcomePosition PDA
+    ///   6 + 4*i + 2: `[writable]` Buyer UserAccount (Vault)
+    ///   6 + 4*i + 3: `[writable]` Buyer PMUserAccount (Vault)
+    MatchMintMultiV2(MatchMintMultiV2Args),
+    
+    /// V2: MatchBurnMulti (Vault CPI, no SPL Token)
+    /// Multi-outcome Complete Set Burn using Vault accounting
+    /// 
+    /// When sum of all outcome sell prices >= 1.0, burn virtual tokens
+    /// and settle seller funds via Vault CPI.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer/Matcher
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[]` VaultConfig
+    /// 4. `[]` Vault Program
+    /// 5. `[]` System Program
+    /// Dynamic accounts (4 per outcome, for i in 0..num_outcomes):
+    ///   6 + 4*i + 0: `[writable]` Order PDA
+    ///   6 + 4*i + 1: `[writable]` Seller MultiOutcomePosition PDA
+    ///   6 + 4*i + 2: `[writable]` Seller UserAccount (Vault)
+    ///   6 + 4*i + 3: `[writable]` Seller PMUserAccount (Vault)
+    MatchBurnMultiV2(MatchBurnMultiV2Args),
 }
 
 // ============================================================================
@@ -882,6 +922,52 @@ pub struct MatchMintMultiArgs {
 ///    - `[writable]` Seller's Token Account
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct MatchBurnMultiArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16)
+    pub num_outcomes: u8,
+    /// Amount to match/burn
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    /// Must contain exactly num_outcomes entries
+    /// Sum of all prices must be >= 1_000_000 (1.0 USDC)
+    pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
+/// Arguments for MatchMintMultiV2 instruction (Pure Vault Mode)
+/// 
+/// V2 Complete Set Mint for multi-outcome market:
+/// Uses Vault CPI instead of SPL Token minting.
+/// 
+/// Accounts:
+/// 0. `[signer]` Relayer/Matcher
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[]` VaultConfig
+/// 4. `[]` Vault Program
+/// 5. `[]` System Program
+/// Dynamic (4 per outcome):
+///   - Order PDA, Position PDA, UserAccount, PMUserAccount
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MatchMintMultiV2Args {
+    /// Market ID
+    pub market_id: u64,
+    /// Number of outcomes (2-16)
+    pub num_outcomes: u8,
+    /// Amount to match/mint
+    pub amount: u64,
+    /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
+    /// Must contain exactly num_outcomes entries
+    /// Sum of all prices must be <= 1_000_000 (1.0 USDC)
+    pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
+/// Arguments for MatchBurnMultiV2 instruction (Pure Vault Mode)
+/// 
+/// V2 Complete Set Burn for multi-outcome market:
+/// Uses Vault CPI instead of SPL Token burning.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MatchBurnMultiV2Args {
     /// Market ID
     pub market_id: u64,
     /// Number of outcomes (2-16)

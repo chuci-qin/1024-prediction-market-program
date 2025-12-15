@@ -279,6 +279,14 @@ pub fn process_instruction(
             msg!("Instruction: ExecuteTradeV2");
             process_execute_trade_v2(program_id, accounts, args)
         }
+        PredictionMarketInstruction::MatchMintMultiV2(args) => {
+            msg!("Instruction: MatchMintMultiV2");
+            process_match_mint_multi_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::MatchBurnMultiV2(args) => {
+            msg!("Instruction: MatchBurnMultiV2");
+            process_match_burn_multi_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -7213,6 +7221,490 @@ fn process_execute_trade_v2(
     msg!("Amount: {}, Price: {}, Cost: {}", match_amount, exec_price, trade_cost);
     msg!("Buyer: {}", buy_order.owner);
     msg!("Seller: {}", sell_order.owner);
+    
+    Ok(())
+}
+
+// ============================================================================
+// Multi-Outcome V2 Instructions (Pure Vault Mode)
+// ============================================================================
+
+/// V2: MatchMintMulti using Vault CPI (no SPL Token)
+/// 
+/// Multi-outcome Complete Set Mint:
+/// When sum of all outcome buy prices <= 1.0, lock buyer funds via Vault CPI
+/// and record virtual token holdings in MultiOutcomePosition PDA.
+/// 
+/// Account layout:
+/// 0. [signer] Relayer/Matcher
+/// 1. [] PredictionMarketConfig
+/// 2. [writable] Market
+/// 3. [] VaultConfig
+/// 4. [] Vault Program
+/// 5. [] System Program
+/// Dynamic accounts (4 per outcome, for i in 0..num_outcomes):
+///   6 + 4*i + 0: [writable] Order PDA
+///   6 + 4*i + 1: [writable] Buyer MultiOutcomePosition PDA
+///   6 + 4*i + 2: [writable] Buyer UserAccount (Vault)
+///   6 + 4*i + 3: [writable] Buyer PMUserAccount (Vault)
+fn process_match_mint_multi_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchMintMultiV2Args,
+) -> ProgramResult {
+    use crate::state::{MAX_OUTCOMES_FOR_MATCH, MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // ========== Fixed Accounts (6) ==========
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify relayer authorization
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Verify market is multi-outcome type
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("Error: MatchMintMultiV2 requires MultiOutcome market type");
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    // Validate num_outcomes
+    if args.num_outcomes < 2 || args.num_outcomes > MAX_OUTCOMES_FOR_MATCH {
+        msg!("Invalid num_outcomes: {}, max is {}", args.num_outcomes, MAX_OUTCOMES_FOR_MATCH);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    if args.num_outcomes != market.num_outcomes {
+        msg!("num_outcomes {} != market.num_outcomes {}", args.num_outcomes, market.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate orders count matches num_outcomes
+    if args.orders.len() != args.num_outcomes as usize {
+        msg!("Orders count {} != num_outcomes {}", args.orders.len(), args.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate price sum <= 1.0 (price conservation for minting)
+    let total_price: u64 = args.orders.iter().map(|(_, _, p)| p).sum();
+    if total_price > PRICE_PRECISION {
+        msg!("Total price {} > 1.0 ({})", total_price, PRICE_PRECISION);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    // Account 3: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // ========== Dynamic Accounts (4 per outcome) ==========
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    let match_amount = args.amount;
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Process each outcome
+    for i in 0..args.num_outcomes as usize {
+        let (expected_outcome_idx, order_id, price) = args.orders[i];
+        
+        // Verify outcome_index is sequential
+        if expected_outcome_idx != i as u8 {
+            msg!("Error: outcome_index {} at position {} (expected {})", expected_outcome_idx, i, i);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Parse accounts for this outcome
+        let order_info = next_account_info(account_info_iter)?;
+        let position_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        
+        // Verify Order PDA
+        let order_id_bytes = order_id.to_le_bytes();
+        let (order_pda, _) = Pubkey::find_program_address(
+            &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *order_info.key != order_pda {
+            msg!("Error: Invalid Order PDA for outcome {}", i);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Load and validate order
+        let mut order = deserialize_account::<Order>(&order_info.data.borrow())?;
+        
+        if order.discriminator != ORDER_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Verify order is a Buy order
+        if order.side != crate::state::OrderSide::Buy {
+            msg!("Error: Order {} must be Buy order for MatchMintMultiV2", order_id);
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        
+        // Verify outcome_index matches
+        if order.outcome_index != expected_outcome_idx {
+            msg!("Error: Order outcome_index {} != expected {}", order.outcome_index, expected_outcome_idx);
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Verify order is active
+        if !order.is_active() {
+            msg!("Error: Order {} is not active", order_id);
+            return Err(PredictionMarketError::OrderNotActive.into());
+        }
+        
+        // Verify remaining amount
+        let remaining = order.remaining_amount();
+        if remaining < match_amount {
+            msg!("Error: Order {} remaining {} < match_amount {}", order_id, remaining, match_amount);
+            return Err(PredictionMarketError::InvalidAmount.into());
+        }
+        
+        // Calculate buyer cost: cost = amount * price / 1_000_000
+        let buyer_cost = (match_amount as u128)
+            .checked_mul(price as u128)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)?
+            .checked_div(PRICE_PRECISION as u128)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
+        
+        // CPI: Lock buyer funds via Vault
+        msg!("CPI: Lock {} for outcome {} buyer", buyer_cost, expected_outcome_idx);
+        cpi_lock_for_prediction(
+            vault_program_info,
+            vault_config_info,
+            user_account_info,
+            pm_user_account_info,
+            config_info,
+            relayer_info,
+            system_program_info,
+            buyer_cost,
+            config_seeds,
+        )?;
+        
+        // Update MultiOutcomePosition: add holdings
+        // Note: Position should be initialized beforehand
+        // If not, initialize a new one
+        let mut position = if position_info.data_len() > 0 && position_info.data.borrow()[0] != 0 {
+            deserialize_account::<MultiOutcomePosition>(&position_info.data.borrow())?
+        } else {
+            // Initialize new position using constructor
+            MultiOutcomePosition::new(
+                args.market_id,
+                args.num_outcomes,
+                order.owner,
+                0, // bump will be calculated if needed
+                current_time,
+            )
+        };
+        
+        // Add to holdings for this outcome
+        let holding_idx = expected_outcome_idx as usize;
+        if holding_idx >= position.holdings.len() {
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        position.holdings[holding_idx] = position.holdings[holding_idx].saturating_add(match_amount);
+        position.total_cost_e6 = position.total_cost_e6.saturating_add(buyer_cost);
+        position.updated_at = current_time;
+        position.serialize(&mut *position_info.data.borrow_mut())?;
+        
+        // Update order
+        order.filled_amount = order.filled_amount.saturating_add(match_amount);
+        if order.filled_amount >= order.amount {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartialFilled;
+        }
+        order.updated_at = current_time;
+        order.serialize(&mut *order_info.data.borrow_mut())?;
+        
+        msg!("Outcome {}: order={}, cost={}, new_holding={}", 
+             expected_outcome_idx, order_id, buyer_cost, position.holdings[holding_idx]);
+    }
+    
+    // Update market stats
+    market.total_minted = market.total_minted.saturating_add(match_amount);
+    market.total_volume_e6 = market.total_volume_e6.saturating_add((match_amount as i64) * (total_price as i64) / 1_000_000);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ MatchMintMultiV2 completed");
+    msg!("Market: {}, Outcomes: {}", args.market_id, args.num_outcomes);
+    msg!("Amount: {}, Total Price: {}", match_amount, total_price);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: MatchBurnMulti using Vault CPI (no SPL Token)
+/// 
+/// Multi-outcome Complete Set Burn:
+/// When sum of all outcome sell prices >= 1.0, settle seller funds via Vault CPI
+/// and reduce virtual token holdings in MultiOutcomePosition PDA.
+fn process_match_burn_multi_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: MatchBurnMultiV2Args,
+) -> ProgramResult {
+    use crate::state::{MAX_OUTCOMES_FOR_MATCH, MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // ========== Fixed Accounts (6) ==========
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("Error: MatchBurnMultiV2 requires MultiOutcome market type");
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    if args.num_outcomes < 2 || args.num_outcomes > MAX_OUTCOMES_FOR_MATCH {
+        msg!("Invalid num_outcomes: {}", args.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    if args.num_outcomes != market.num_outcomes {
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    if args.orders.len() != args.num_outcomes as usize {
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate price sum >= 1.0 (price conservation for burning)
+    let total_price: u64 = args.orders.iter().map(|(_, _, p)| p).sum();
+    if total_price < PRICE_PRECISION {
+        msg!("Total price {} < 1.0 ({})", total_price, PRICE_PRECISION);
+        return Err(PredictionMarketError::InvalidPricePair.into());
+    }
+    
+    // Account 3: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: System Program
+    let _system_program_info = next_account_info(account_info_iter)?;
+    
+    // ========== Dynamic Accounts (4 per outcome) ==========
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    let match_amount = args.amount;
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Process each outcome
+    for i in 0..args.num_outcomes as usize {
+        let (expected_outcome_idx, order_id, price) = args.orders[i];
+        
+        if expected_outcome_idx != i as u8 {
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        // Parse accounts for this outcome
+        let order_info = next_account_info(account_info_iter)?;
+        let position_info = next_account_info(account_info_iter)?;
+        let _user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        
+        // Verify Order PDA
+        let order_id_bytes = order_id.to_le_bytes();
+        let (order_pda, _) = Pubkey::find_program_address(
+            &[ORDER_SEED, &market_id_bytes, &order_id_bytes],
+            program_id,
+        );
+        if *order_info.key != order_pda {
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Load and validate order
+        let mut order = deserialize_account::<Order>(&order_info.data.borrow())?;
+        
+        if order.discriminator != ORDER_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Verify order is a Sell order
+        if order.side != crate::state::OrderSide::Sell {
+            msg!("Error: Order {} must be Sell order for MatchBurnMultiV2", order_id);
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        
+        if order.outcome_index != expected_outcome_idx {
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        if !order.is_active() {
+            return Err(PredictionMarketError::OrderNotActive.into());
+        }
+        
+        let remaining = order.remaining_amount();
+        if remaining < match_amount {
+            msg!("Error: Order remaining {} < match_amount {}", remaining, match_amount);
+            return Err(PredictionMarketError::InvalidAmount.into());
+        }
+        
+        // Load and validate position
+        let mut position = deserialize_account::<MultiOutcomePosition>(&position_info.data.borrow())?;
+        
+        if position.discriminator != MULTI_OUTCOME_POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        // Verify seller has sufficient holdings
+        let holding_idx = expected_outcome_idx as usize;
+        if holding_idx >= position.holdings.len() {
+            return Err(PredictionMarketError::InvalidOutcome.into());
+        }
+        
+        if position.holdings[holding_idx] < match_amount {
+            msg!("Error: Seller has insufficient holdings: {} < {}", 
+                 position.holdings[holding_idx], match_amount);
+            return Err(PredictionMarketError::InsufficientPosition.into());
+        }
+        
+        // Calculate seller proceeds: proceeds = amount * price / 1_000_000
+        let seller_proceeds = (match_amount as u128)
+            .checked_mul(price as u128)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)?
+            .checked_div(PRICE_PRECISION as u128)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
+        
+        // CPI: Settle seller funds via Vault (locked=0, settlement=proceeds)
+        msg!("CPI: Settle {} for outcome {} seller", seller_proceeds, expected_outcome_idx);
+        cpi_prediction_settle(
+            vault_program_info,
+            vault_config_info,
+            pm_user_account_info,
+            config_info,
+            0,              // locked_amount: seller didn't lock for sell
+            seller_proceeds, // settlement_amount
+            config_seeds,
+        )?;
+        
+        // Update position: reduce holdings
+        position.holdings[holding_idx] = position.holdings[holding_idx].saturating_sub(match_amount);
+        position.realized_pnl = position.realized_pnl.saturating_add(seller_proceeds as i64);
+        position.updated_at = current_time;
+        position.serialize(&mut *position_info.data.borrow_mut())?;
+        
+        // Update order
+        order.filled_amount = order.filled_amount.saturating_add(match_amount);
+        if order.filled_amount >= order.amount {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartialFilled;
+        }
+        order.updated_at = current_time;
+        order.serialize(&mut *order_info.data.borrow_mut())?;
+        
+        msg!("Outcome {}: order={}, proceeds={}, remaining_holding={}", 
+             expected_outcome_idx, order_id, seller_proceeds, position.holdings[holding_idx]);
+    }
+    
+    // Update market stats
+    market.total_minted = market.total_minted.saturating_sub(match_amount);
+    market.total_volume_e6 = market.total_volume_e6.saturating_add((match_amount as i64) * (total_price as i64) / 1_000_000);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ MatchBurnMultiV2 completed");
+    msg!("Market: {}, Outcomes: {}", args.market_id, args.num_outcomes);
+    msg!("Amount: {}, Total Price: {}", match_amount, total_price);
+    msg!("Total Minted: {}", market.total_minted);
     
     Ok(())
 }
