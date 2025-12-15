@@ -16,7 +16,7 @@ const {
 const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
 
 // Program and account IDs
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
 const VAULT_PROGRAM = new PublicKey('8n3FHwYxFgQCQc2FNFkwDUf9mcqupxXcCvgfHbApUzYU');
 const FUND_PROGRAM = new PublicKey('FPhDzu7yCDC1BBvzGwpM6dHHNQBPpKEv6Y3Ptdc7o3fJ');
 const USDC_MINT = new PublicKey('7pCrfxhcAEyTFDhrhKRtRS2iMvEYx2dtNE7NzwuU7SA9');

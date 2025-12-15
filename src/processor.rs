@@ -275,6 +275,10 @@ pub fn process_instruction(
             msg!("Instruction: RelayerClaimWinningsV2");
             process_relayer_claim_winnings_v2(program_id, accounts, args)
         }
+        PredictionMarketInstruction::ExecuteTradeV2(args) => {
+            msg!("Instruction: ExecuteTradeV2");
+            process_execute_trade_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -6893,6 +6897,322 @@ fn process_relayer_claim_winnings_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Result: {:?}", final_result);
     msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
+    
+    Ok(())
+}
+
+/// V2: ExecuteTrade using Vault CPI (no SPL Token)
+/// 
+/// Direct trade between buyer and seller:
+/// - Buyer has USDC locked in pm_locked (from RelayerPlaceOrder)
+/// - Seller has virtual shares in Position PDA
+/// - Trade transfers USDC (buyer → seller) and shares (seller → buyer)
+/// 
+/// Flow:
+/// 1. Validate orders (same outcome, price compatible, sufficient amounts)
+/// 2. Validate seller has sufficient Position shares
+/// 3. CPI: Settle buyer (locked=cost, settlement=0) - deduct from buyer's pm_locked
+/// 4. CPI: Settle seller (locked=0, settlement=cost) - add to seller's pending_settlement  
+/// 5. Update Positions: transfer shares from seller to buyer
+/// 6. Update Orders: mark filled/partial_filled
+fn process_execute_trade_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ExecuteTradeArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer/Keeper (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Buy Order (writable)
+    let buy_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: Sell Order (writable)
+    let sell_order_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Buyer Position PDA (writable)
+    let buyer_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Seller Position PDA (writable)
+    let seller_position_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Buyer UserAccount (Vault, writable) - not used in Settle, but for validation
+    let _buyer_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Buyer PMUserAccount (Vault, writable)
+    let buyer_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: Seller UserAccount (Vault, writable) - not used in Settle
+    let _seller_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: Seller PMUserAccount (Vault, writable)
+    let seller_pm_user_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 12: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 13: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify Market PDA
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let (market_pda, _) = Pubkey::find_program_address(
+        &[MARKET_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *market_info.key != market_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Verify Order PDAs
+    let taker_order_id_bytes = args.taker_order_id.to_le_bytes();
+    let (buy_order_pda, _) = Pubkey::find_program_address(
+        &[ORDER_SEED, &market_id_bytes, &taker_order_id_bytes],
+        program_id,
+    );
+    if *buy_order_info.key != buy_order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let maker_order_id_bytes = args.maker_order_id.to_le_bytes();
+    let (sell_order_pda, _) = Pubkey::find_program_address(
+        &[ORDER_SEED, &market_id_bytes, &maker_order_id_bytes],
+        program_id,
+    );
+    if *sell_order_info.key != sell_order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load orders
+    let mut buy_order = deserialize_account::<Order>(&buy_order_info.data.borrow())?;
+    let mut sell_order = deserialize_account::<Order>(&sell_order_info.data.borrow())?;
+    
+    // Validate orders
+    if buy_order.discriminator != ORDER_DISCRIMINATOR || sell_order.discriminator != ORDER_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify order sides
+    if buy_order.side != crate::state::OrderSide::Buy {
+        msg!("Error: Order {} is not a buy order", args.taker_order_id);
+        return Err(PredictionMarketError::InvalidOrderSide.into());
+    }
+    if sell_order.side != crate::state::OrderSide::Sell {
+        msg!("Error: Order {} is not a sell order", args.maker_order_id);
+        return Err(PredictionMarketError::InvalidOrderSide.into());
+    }
+    
+    // Verify same outcome
+    if buy_order.outcome != sell_order.outcome {
+        msg!("Error: Orders must be for the same outcome");
+        return Err(PredictionMarketError::OutcomeMismatch.into());
+    }
+    
+    let outcome = buy_order.outcome;
+    
+    // Verify orders are active
+    if !buy_order.is_active() || !sell_order.is_active() {
+        msg!("Error: One or both orders are not active");
+        return Err(PredictionMarketError::OrderNotActive.into());
+    }
+    
+    // Verify price compatibility (buy price >= sell price)
+    if buy_order.price < sell_order.price {
+        msg!("Error: Buy price {} must be >= sell price {}", buy_order.price, sell_order.price);
+        return Err(PredictionMarketError::PriceMismatch.into());
+    }
+    
+    // Calculate matchable amount
+    let buy_remaining = buy_order.remaining_amount();
+    let sell_remaining = sell_order.remaining_amount();
+    let match_amount = args.amount.min(buy_remaining).min(sell_remaining);
+    
+    if match_amount == 0 {
+        return Err(PredictionMarketError::NoMatchableAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    
+    // Execution price (use provided price, should be <= buy_price and >= sell_price)
+    let exec_price = args.price;
+    if exec_price < sell_order.price || exec_price > buy_order.price {
+        msg!("Error: Execution price {} out of bounds [{}, {}]", 
+             exec_price, sell_order.price, buy_order.price);
+        return Err(PredictionMarketError::InvalidExecutionPrice.into());
+    }
+    
+    // Calculate trade cost: cost = amount * price / PRICE_PRECISION
+    let trade_cost = (match_amount as u128)
+        .checked_mul(exec_price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
+    
+    msg!("V2 Direct Trade: amount={}, price={}, cost={}", match_amount, exec_price, trade_cost);
+    
+    // Verify Position PDAs
+    let (buyer_position_pda, _) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, buy_order.owner.as_ref()],
+        program_id,
+    );
+    if *buyer_position_info.key != buyer_position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let (seller_position_pda, _) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, sell_order.owner.as_ref()],
+        program_id,
+    );
+    if *seller_position_info.key != seller_position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load seller position to verify sufficient shares
+    let mut seller_position = deserialize_account::<Position>(&seller_position_info.data.borrow())?;
+    if seller_position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Check seller has sufficient shares for the outcome
+    let seller_shares = match outcome {
+        Outcome::Yes => seller_position.yes_amount,
+        Outcome::No => seller_position.no_amount,
+    };
+    
+    if seller_shares < match_amount {
+        msg!("Error: Seller has insufficient shares: {} < {}", seller_shares, match_amount);
+        return Err(PredictionMarketError::InsufficientPosition.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: CPI - Settle buyer (deduct from pm_locked)
+    // locked=trade_cost, settlement=0
+    msg!("CPI: Settle buyer - deduct {} from pm_locked", trade_cost);
+    cpi_prediction_settle(
+        vault_program_info,
+        vault_config_info,
+        buyer_pm_user_info,
+        config_info,
+        trade_cost,    // locked_amount to deduct
+        0,             // settlement_amount (none for buyer in trade)
+        config_seeds,
+    )?;
+    
+    // Step 2: CPI - Settle seller (add to pending_settlement)
+    // locked=0, settlement=trade_cost
+    msg!("CPI: Settle seller - add {} to pending_settlement", trade_cost);
+    cpi_prediction_settle(
+        vault_program_info,
+        vault_config_info,
+        seller_pm_user_info,
+        config_info,
+        0,             // locked_amount (seller didn't lock for sell order in V2)
+        trade_cost,    // settlement_amount
+        config_seeds,
+    )?;
+    
+    // Step 3: Update Positions - transfer shares
+    // Load or initialize buyer position
+    let mut buyer_position = if buyer_position_info.data_len() > 0 {
+        deserialize_account::<Position>(&buyer_position_info.data.borrow())?
+    } else {
+        // Position should be initialized by now (via MintCompleteSet or auto-init)
+        return Err(PredictionMarketError::PositionNotFound.into());
+    };
+    
+    // Transfer shares
+    match outcome {
+        Outcome::Yes => {
+            seller_position.yes_amount = seller_position.yes_amount.saturating_sub(match_amount);
+            buyer_position.yes_amount = buyer_position.yes_amount.saturating_add(match_amount);
+        }
+        Outcome::No => {
+            seller_position.no_amount = seller_position.no_amount.saturating_sub(match_amount);
+            buyer_position.no_amount = buyer_position.no_amount.saturating_add(match_amount);
+        }
+    }
+    
+    seller_position.updated_at = current_time;
+    buyer_position.updated_at = current_time;
+    
+    seller_position.serialize(&mut *seller_position_info.data.borrow_mut())?;
+    buyer_position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+    
+    // Step 4: Update Orders
+    buy_order.filled_amount += match_amount;
+    if buy_order.filled_amount >= buy_order.amount {
+        buy_order.status = OrderStatus::Filled;
+    } else {
+        buy_order.status = OrderStatus::PartialFilled;
+    }
+    buy_order.updated_at = current_time;
+    buy_order.serialize(&mut *buy_order_info.data.borrow_mut())?;
+    
+    sell_order.filled_amount += match_amount;
+    if sell_order.filled_amount >= sell_order.amount {
+        sell_order.status = OrderStatus::Filled;
+    } else {
+        sell_order.status = OrderStatus::PartialFilled;
+    }
+    sell_order.updated_at = current_time;
+    sell_order.serialize(&mut *sell_order_info.data.borrow_mut())?;
+    
+    // Step 5: Update Market stats
+    market.total_volume_e6 = market.total_volume_e6.saturating_add(trade_cost as i64);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // Emit success log
+    msg!("✅ ExecuteTradeV2 completed");
+    msg!("Market: {}, Outcome: {:?}", args.market_id, outcome);
+    msg!("Buy Order: {}, Sell Order: {}", args.taker_order_id, args.maker_order_id);
+    msg!("Amount: {}, Price: {}, Cost: {}", match_amount, exec_price, trade_cost);
+    msg!("Buyer: {}", buy_order.owner);
+    msg!("Seller: {}", sell_order.owner);
     
     Ok(())
 }

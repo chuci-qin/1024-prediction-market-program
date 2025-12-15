@@ -41,7 +41,7 @@
 
 | 网络 | Program ID |
 |------|-----------|
-| 1024Chain Testnet | `FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu` |
+| 1024Chain Testnet | `FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58` |
 | 1024Chain Mainnet | TBD |
 
 **⚠️ 多选市场限制**: 最大支持 **16 个 outcomes** 用于撮合操作 (MatchMintMulti/MatchBurnMulti)，以避免超过 Solana 64 账户限制

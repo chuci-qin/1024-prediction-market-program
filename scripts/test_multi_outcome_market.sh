@@ -20,7 +20,7 @@ echo -e "${CYAN}║     Multi-Outcome Market Integration Test                   
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
 
 # Configuration
-PROGRAM_ID="FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu"
+PROGRAM_ID="FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58"
 RPC_URL="${RPC_URL:-https://testnet-rpc.1024chain.com/rpc/}"
 KEYPAIR_PATH="${HOME}/.config/solana/id.json"
 

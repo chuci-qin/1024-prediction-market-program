@@ -14,7 +14,7 @@ const {
 const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } = require('@solana/spl-token');
 const fs = require('fs');
 
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
 
 // Seeds
 const PM_CONFIG_SEED = Buffer.from('pm_config');

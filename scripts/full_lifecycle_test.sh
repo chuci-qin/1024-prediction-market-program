@@ -9,7 +9,7 @@ echo "============================================================"
 echo "  1024 Prediction Market - Full Lifecycle Test"
 echo "============================================================"
 echo ""
-echo "Program ID: FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu"
+echo "Program ID: FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58"
 echo "Date: $(date)"
 echo ""
 

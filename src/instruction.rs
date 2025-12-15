@@ -631,6 +631,31 @@ pub enum PredictionMarketInstruction {
     /// 5. `[]` Vault Config
     /// 6. `[]` Vault Program
     RelayerClaimWinningsV2(RelayerClaimWinningsArgs),
+    
+    /// V2: ExecuteTrade (Vault CPI, no SPL Token)
+    /// Direct trade between buyer and seller using Vault accounting
+    /// 
+    /// In V2 mode:
+    /// - Buyer has USDC locked in pm_locked via Vault
+    /// - Seller has virtual shares in Position PDA
+    /// - Trade transfers USDC (buyer → seller) and shares (seller → buyer)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer/Keeper
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Buy Order PDA
+    /// 4. `[writable]` Sell Order PDA
+    /// 5. `[writable]` Buyer Position PDA
+    /// 6. `[writable]` Seller Position PDA
+    /// 7. `[writable]` Buyer UserAccount (Vault)
+    /// 8. `[writable]` Buyer PMUserAccount (Vault)
+    /// 9. `[writable]` Seller UserAccount (Vault)
+    /// 10. `[writable]` Seller PMUserAccount (Vault)
+    /// 11. `[]` VaultConfig
+    /// 12. `[]` Vault Program
+    /// 13. `[]` System Program
+    ExecuteTradeV2(ExecuteTradeArgs),
 }
 
 // ============================================================================

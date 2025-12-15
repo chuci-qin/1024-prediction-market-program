@@ -5,7 +5,7 @@
 
 const { Connection, PublicKey } = require('@solana/web3.js');
 
-const PROGRAM_ID = new PublicKey('FnwmQjmUkRTLA1G3i1CmFVE5cySzQGYZRezGAErdLizu');
+const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
 const ORDER_SEED = Buffer.from('order');
 const MARKET_SEED = Buffer.from('market');
 
