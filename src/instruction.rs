@@ -696,6 +696,37 @@ pub enum PredictionMarketInstruction {
     ///   6 + 4*i + 2: `[writable]` Seller UserAccount (Vault)
     ///   6 + 4*i + 3: `[writable]` Seller PMUserAccount (Vault)
     MatchBurnMultiV2(MatchBurnMultiV2Args),
+    
+    /// V2: RelayerPlaceOrder (Vault CPI for margin lock)
+    /// Place order on behalf of user with margin locked in Vault
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA (new)
+    /// 4. `[writable]` Position PDA
+    /// 5. `[writable]` UserAccount (Vault)
+    /// 6. `[writable]` PMUserAccount (Vault)
+    /// 7. `[]` VaultConfig
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    RelayerPlaceOrderV2(RelayerPlaceOrderV2Args),
+    
+    /// V2: RelayerCancelOrder (Vault CPI for margin unlock)
+    /// Cancel order and unlock margin from Vault
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA
+    /// 4. `[writable]` UserAccount (Vault)
+    /// 5. `[writable]` PMUserAccount (Vault)
+    /// 6. `[]` VaultConfig
+    /// 7. `[]` Vault Program
+    /// 8. `[]` System Program
+    RelayerCancelOrderV2(RelayerCancelOrderV2Args),
 }
 
 // ============================================================================
@@ -1165,6 +1196,38 @@ pub struct RelayerPlaceOrderArgs {
 /// Relayer版本的CancelOrder
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct RelayerCancelOrderArgs {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order ID
+    pub order_id: u64,
+}
+
+/// V2: Relayer版本的PlaceOrder (with Vault CPI)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerPlaceOrderV2Args {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order side (Buy/Sell)
+    pub side: OrderSide,
+    /// Outcome (YES/NO or outcome index)
+    pub outcome: Outcome,
+    /// Price (e6)
+    pub price: u64,
+    /// Amount in tokens
+    pub amount: u64,
+    /// Order type
+    pub order_type: OrderType,
+    /// Expiration time (for GTD orders)
+    pub expiration_time: Option<i64>,
+}
+
+/// V2: Relayer版本的CancelOrder (with Vault CPI)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerCancelOrderV2Args {
     /// 用户钱包地址
     pub user_wallet: Pubkey,
     /// Market ID
