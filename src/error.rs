@@ -57,6 +57,9 @@ pub enum PredictionMarketError {
     #[error("Invalid argument")]
     InvalidArgument = 14,
     
+    #[error("Instruction deprecated - use V2 version")]
+    InstructionDeprecated = 15,
+    
     // === Market Errors (100-199) ===
     
     #[error("Market not found")]
