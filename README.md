@@ -88,6 +88,119 @@
 
 ---
 
+## 🎯 与 Vault 的一体化集成
+
+### 一体化账户架构
+
+1024 DEX 采用**一体化账户架构**：交易所（永续合约）和预测市场**共享同一个 Vault 账户**。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         一体化资金管理架构                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   用户入金 → Vault Program → UserAccount.available_balance              │
+│                                      │                                  │
+│                     ┌────────────────┴────────────────┐                │
+│                     │                                 │                │
+│                     ▼                                 ▼                │
+│            ┌─────────────────┐              ┌─────────────────┐       │
+│            │   交易所下单     │              │  预测市场下单    │       │
+│            │  (永续合约)      │              │   (CTF)         │       │
+│            └────────┬────────┘              └────────┬────────┘       │
+│                     │                                 │                │
+│                     ▼                                 ▼                │
+│            ┌─────────────────┐              ┌─────────────────┐       │
+│            │ Ledger Program  │              │  PM Program     │       │
+│            │ CPI: LockMargin │              │ CPI: PM Lock    │       │
+│            └────────┬────────┘              └────────┬────────┘       │
+│                     │                                 │                │
+│                     ▼                                 ▼                │
+│            ┌─────────────────┐              ┌─────────────────┐       │
+│            │ UserAccount     │              │ PMUserAccount   │       │
+│            │ .locked_margin  │              │ .pm_locked      │       │
+│            └─────────────────┘              └─────────────────┘       │
+│                                                                         │
+│   ✅ 共享 available_balance    ✅ 一个账户两个市场    ✅ 一次入金     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### CPI 资金锁定流程
+
+当用户在预测市场下单时，PM Program 通过 CPI 调用 Vault Program：
+
+```rust
+// 1. 用户下单 (Buy YES @ $0.50, 100 合约)
+// 2. 计算保证金: 100 × 500,000 = 50,000,000 e6 = $50
+
+// 3. PM Program 调用 Vault CPI
+cpi_lock_for_prediction(
+    vault_program,       // Vault Program
+    vault_config,        // Vault 配置
+    user_account,        // UserAccount PDA (扣除 available_balance)
+    pm_user_account,     // PMUserAccount PDA (增加 pm_locked)
+    pm_config,           // PM Config PDA (作为 CPI caller)
+    amount,              // 50,000,000 e6
+)?;
+```
+
+**CPI 调用后状态变化：**
+```
+UserAccount:
+  available_balance: $950 → $900 (扣除 $50)
+
+PMUserAccount:
+  pm_locked: $0 → $50 (锁定 $50)
+```
+
+### 为什么需要 PMUserAccount？
+
+| 问题 | 答案 |
+|------|------|
+| 为什么不直接用 UserAccount.locked_margin？ | 风险模型不同：交易所有杠杆爆仓风险，预测市场没有 |
+| PMUserAccount 是独立账户吗？ | 否，它是"锁定资金追踪器"，共享 available_balance |
+| 用户需要分别入金吗？ | 否，一次入金可在两个市场使用 |
+
+### Vault CPI 指令索引
+
+| 指令 | Index | 说明 |
+|------|-------|------|
+| `PredictionMarketLock` | 16 | 从 available_balance 扣除到 pm_locked |
+| `PredictionMarketUnlock` | 17 | 从 pm_locked 返还到 available_balance |
+| `PredictionMarketSettle` | 18 | 市场结算，更新 pm_locked 和 pm_pending |
+| `PredictionMarketClaimSettlement` | 19 | 用户领取待结算收益 |
+
+### CPI Caller 验证
+
+> ⚠️ **重要**: Vault Program 验证 CPI caller 是否在 `authorized_callers` 白名单中。
+
+**需要添加到 Vault 白名单的是 PM Config PDA，不是 PM Program ID！**
+
+```typescript
+// 正确 ✅ - 添加 PM Config PDA
+const PM_CONFIG_PDA = "BLPdJuvYHzUf1mcNTEBQHHt1SzD3LxTgsNqQe5tCeD1k";
+
+// 错误 ❌ - 不是添加 PM Program ID
+const PM_PROGRAM_ID = "FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58";
+```
+
+因为 CPI 调用时，`caller_program` 参数是 PM Config PDA：
+
+```rust
+// processor.rs - RelayerPlaceOrderV2
+cpi_lock_for_prediction(
+    vault_program_info,
+    vault_config_info,
+    user_vault_info,
+    pm_user_info,
+    config_info,     // ← PM Config PDA 作为 caller
+    ...
+)?;
+```
+
+---
+
 ## 架构设计
 
 ### 交易流程
@@ -965,13 +1078,19 @@ MIT
 
 ---
 
-*Last Updated: 2025-12-08*
+*Last Updated: 2025-12-17*
 
 ---
 
-## 更新日志 (v2.0.0)
+## 更新日志
 
-### 新增功能
+### 2025-12-17 - Vault CPI 集成文档
+- 添加"与 Vault 的一体化集成"章节
+- 详细说明一体化账户架构：交易所和预测市场共享 Vault 账户
+- 强调 CPI Caller 是 PM Config PDA，不是 PM Program ID
+- 修复保证金计算 Bug：移除错误的 `/ PRICE_PRECISION` 除法
+
+### v2.0.0 新增功能
 
 1. **多选市场撮合指令**
    - `MatchMintMulti` - N 个买单撮合铸造

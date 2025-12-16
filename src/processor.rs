@@ -3600,11 +3600,12 @@ fn process_relayer_place_order_v2(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    // Calculate margin requirement
+    // Calculate margin requirement (in e6 precision)
+    // margin_e6 = amount * price_e6
+    // Example: 100 contracts × 500,000 (50%) = 50,000,000 e6 = $50 USDC
+    // NOTE: Do NOT divide by PRICE_PRECISION! price is already in e6 format.
     let margin = (args.amount as u128)
         .checked_mul(args.price as u128)
-        .ok_or(PredictionMarketError::ArithmeticOverflow)?
-        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
@@ -3801,12 +3802,12 @@ fn process_relayer_cancel_order_v2(
     // Account 8: System Program
     let _system_program_info = next_account_info(account_info_iter)?;
     
-    // Calculate remaining margin to unlock
+    // Calculate remaining margin to unlock (in e6 precision)
+    // remaining_margin_e6 = remaining_amount * price_e6
+    // NOTE: Do NOT divide by PRICE_PRECISION! price is already in e6 format.
     let remaining = order.remaining_amount();
     let remaining_margin = (remaining as u128)
         .checked_mul(order.price as u128)
-        .ok_or(PredictionMarketError::ArithmeticOverflow)?
-        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
