@@ -713,19 +713,20 @@ pub enum PredictionMarketInstruction {
     /// 9. `[]` System Program
     RelayerPlaceOrderV2(RelayerPlaceOrderV2Args),
     
-    /// V2: RelayerCancelOrder (Vault CPI for margin unlock)
-    /// Cancel order and unlock margin from Vault
+    /// V2: RelayerCancelOrder (Vault CPI for margin unlock + Position share unlock)
+    /// Cancel order and unlock margin from Vault (for Buy) or shares from Position (for Sell)
     /// 
     /// Accounts:
     /// 0. `[signer]` Relayer
     /// 1. `[]` PredictionMarketConfig
     /// 2. `[writable]` Market
     /// 3. `[writable]` Order PDA
-    /// 4. `[writable]` UserAccount (Vault)
-    /// 5. `[writable]` PMUserAccount (Vault)
-    /// 6. `[]` VaultConfig
-    /// 7. `[]` Vault Program
-    /// 8. `[]` System Program
+    /// 4. `[writable]` Position PDA (for Sell order share unlock)
+    /// 5. `[writable]` UserAccount (Vault)
+    /// 6. `[writable]` PMUserAccount (Vault)
+    /// 7. `[]` VaultConfig
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
     RelayerCancelOrderV2(RelayerCancelOrderV2Args),
 }
 

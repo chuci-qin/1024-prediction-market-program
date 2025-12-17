@@ -503,6 +503,11 @@ impl OutcomeMetadata {
 /// Uses a fixed-size array for up to MAX_OUTCOMES outcomes.
 /// 
 /// PDA Seeds: ["position", market_id.to_le_bytes(), owner.key()]
+/// 
+/// **Note on Account Size Migration:**
+/// In V2.0, the `locked` array was added (256 bytes for MAX_OUTCOMES=32).
+/// For existing accounts, reallocation may be needed via `realloc` in processor.
+/// New accounts are created with the full SIZE including locked.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct MultiOutcomePosition {
     /// Account discriminator
@@ -520,6 +525,10 @@ pub struct MultiOutcomePosition {
     /// Holdings for each outcome (up to MAX_OUTCOMES)
     /// Each element is the token amount for that outcome index
     pub holdings: [u64; MAX_OUTCOMES],
+    
+    /// Locked shares for each outcome (pending Sell orders)
+    /// Available = holdings[i] - locked[i]
+    pub locked: [u64; MAX_OUTCOMES],
     
     /// Average cost for each outcome (e6)
     pub avg_costs: [u64; MAX_OUTCOMES],
@@ -545,18 +554,18 @@ pub struct MultiOutcomePosition {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use
+    /// Reserved for future use (reduced due to locked array)
     pub reserved: [u8; 32],
 }
 
 impl MultiOutcomePosition {
-    // holdings: 32 * 8 = 256 bytes, avg_costs: 32 * 8 = 256 bytes
-    pub const SIZE: usize = 8   // discriminator
+    /// Old size (before locked array) - for migration detection
+    pub const SIZE_V1: usize = 8   // discriminator
         + 8   // market_id
         + 1   // num_outcomes
         + 32  // owner
-        + (MAX_OUTCOMES * 8)  // holdings
-        + (MAX_OUTCOMES * 8)  // avg_costs
+        + (MAX_OUTCOMES * 8)  // holdings (256 bytes)
+        + (MAX_OUTCOMES * 8)  // avg_costs (256 bytes)
         + 8   // realized_pnl
         + 8   // total_cost_e6
         + 1   // settled
@@ -564,16 +573,35 @@ impl MultiOutcomePosition {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 32; // reserved
+        + 32; // reserved = 637 bytes
+    
+    /// Current size (with locked array)
+    /// holdings: 32 * 8 = 256, locked: 32 * 8 = 256, avg_costs: 32 * 8 = 256
+    pub const SIZE: usize = 8   // discriminator
+        + 8   // market_id
+        + 1   // num_outcomes
+        + 32  // owner
+        + (MAX_OUTCOMES * 8)  // holdings (256 bytes)
+        + (MAX_OUTCOMES * 8)  // locked (256 bytes) - NEW
+        + (MAX_OUTCOMES * 8)  // avg_costs (256 bytes)
+        + 8   // realized_pnl
+        + 8   // total_cost_e6
+        + 1   // settled
+        + 8   // settlement_amount
+        + 8   // created_at
+        + 8   // updated_at
+        + 1   // bump
+        + 32; // reserved = 893 bytes
     
     /// Create a new empty multi-outcome position
     pub fn new(market_id: u64, num_outcomes: u8, owner: Pubkey, bump: u8, created_at: i64) -> Self {
         Self {
-            discriminator: POSITION_DISCRIMINATOR,
+            discriminator: MULTI_OUTCOME_POSITION_DISCRIMINATOR,
             market_id,
             num_outcomes,
             owner,
             holdings: [0u64; MAX_OUTCOMES],
+            locked: [0u64; MAX_OUTCOMES],
             avg_costs: [0u64; MAX_OUTCOMES],
             realized_pnl: 0,
             total_cost_e6: 0,
@@ -633,6 +661,120 @@ impl MultiOutcomePosition {
         } else {
             0
         }
+    }
+    
+    // =========================================================================
+    // Locked Shares Methods (for Sell Order Support)
+    // =========================================================================
+    
+    /// Get available holdings for a specific outcome (total - locked)
+    pub fn available(&self, outcome_index: u8) -> u64 {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return 0;
+        }
+        self.holdings[idx].saturating_sub(self.locked[idx])
+    }
+    
+    /// Get locked amount for a specific outcome
+    pub fn get_locked(&self, outcome_index: u8) -> u64 {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return 0;
+        }
+        self.locked[idx]
+    }
+    
+    /// Lock shares for a Sell order
+    /// 
+    /// Returns Ok(()) if successful, Err if insufficient available shares
+    pub fn lock_shares(&mut self, outcome_index: u8, amount: u64) -> Result<(), ()> {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return Err(());
+        }
+        
+        let available = self.available(outcome_index);
+        if available < amount {
+            return Err(());
+        }
+        
+        self.locked[idx] += amount;
+        Ok(())
+    }
+    
+    /// Unlock shares when a Sell order is cancelled
+    /// 
+    /// Returns Ok(()) if successful, Err if trying to unlock more than locked
+    pub fn unlock_shares(&mut self, outcome_index: u8, amount: u64) -> Result<(), ()> {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return Err(());
+        }
+        
+        if self.locked[idx] < amount {
+            return Err(());
+        }
+        
+        self.locked[idx] -= amount;
+        Ok(())
+    }
+    
+    /// Consume locked shares when a Sell order is filled
+    /// 
+    /// This removes shares from both locked and holdings.
+    /// Used during MatchBurnMultiV2.
+    /// 
+    /// Returns Ok(()) if successful, Err if insufficient locked shares
+    pub fn consume_locked_shares(
+        &mut self,
+        outcome_index: u8,
+        amount: u64,
+        price: u64,
+        current_time: i64,
+    ) -> Result<(), ()> {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return Err(());
+        }
+        
+        if self.locked[idx] < amount {
+            return Err(());
+        }
+        
+        // Unlock first
+        self.locked[idx] -= amount;
+        
+        // Then remove from holdings
+        self.holdings[idx] = self.holdings[idx].saturating_sub(amount);
+        
+        // Calculate realized PnL
+        let cost_basis = self.avg_costs[idx];
+        let proceeds = ((amount as u128) * (price as u128) / (PRICE_PRECISION as u128)) as i64;
+        let cost = ((amount as u128) * (cost_basis as u128) / (PRICE_PRECISION as u128)) as i64;
+        self.realized_pnl += proceeds - cost;
+        
+        self.updated_at = current_time;
+        Ok(())
+    }
+    
+    /// Remove tokens for a specific outcome (without requiring locked)
+    /// Used for settlements and direct removes
+    pub fn remove_tokens(&mut self, outcome_index: u8, amount: u64, price: u64, current_time: i64) {
+        let idx = outcome_index as usize;
+        if idx >= MAX_OUTCOMES {
+            return;
+        }
+        
+        self.holdings[idx] = self.holdings[idx].saturating_sub(amount);
+        
+        // Calculate realized PnL
+        let cost_basis = self.avg_costs[idx];
+        let proceeds = ((amount as u128) * (price as u128) / (PRICE_PRECISION as u128)) as i64;
+        let cost = ((amount as u128) * (cost_basis as u128) / (PRICE_PRECISION as u128)) as i64;
+        self.realized_pnl += proceeds - cost;
+        
+        self.updated_at = current_time;
     }
 }
 
@@ -800,11 +942,19 @@ pub struct Position {
     /// Position owner
     pub owner: Pubkey,
     
-    /// YES token holdings
+    /// YES token holdings (total)
     pub yes_amount: u64,
     
-    /// NO token holdings
+    /// NO token holdings (total)
     pub no_amount: u64,
+    
+    /// YES tokens locked for pending Sell orders
+    /// Available YES = yes_amount - yes_locked
+    pub yes_locked: u64,
+    
+    /// NO tokens locked for pending Sell orders
+    /// Available NO = no_amount - no_locked
+    pub no_locked: u64,
     
     /// Average cost basis for YES (e6)
     pub yes_avg_cost: u64,
@@ -833,16 +983,19 @@ pub struct Position {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use
-    pub reserved: [u8; 32],
+    /// Reserved for future use (reduced from 32 to 16 for locked fields)
+    pub reserved: [u8; 16],
 }
 
 impl Position {
+    /// Account size: 146 bytes (unchanged - locked fields use reserved space)
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 32  // owner
         + 8   // yes_amount
         + 8   // no_amount
+        + 8   // yes_locked (NEW)
+        + 8   // no_locked (NEW)
         + 8   // yes_avg_cost
         + 8   // no_avg_cost
         + 8   // realized_pnl
@@ -852,7 +1005,7 @@ impl Position {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 32; // reserved
+        + 16; // reserved (reduced from 32 to 16)
     
     /// PDA seeds
     pub fn seeds(market_id: u64, owner: &Pubkey) -> Vec<Vec<u8>> {
@@ -871,6 +1024,8 @@ impl Position {
             owner,
             yes_amount: 0,
             no_amount: 0,
+            yes_locked: 0,
+            no_locked: 0,
             yes_avg_cost: 0,
             no_avg_cost: 0,
             realized_pnl: 0,
@@ -880,7 +1035,7 @@ impl Position {
             created_at,
             updated_at: created_at,
             bump,
-            reserved: [0u8; 32],
+            reserved: [0u8; 16],
         }
     }
     
@@ -969,6 +1124,102 @@ impl Position {
         self.realized_pnl += proceeds - cost;
         
         self.updated_at = current_time;
+    }
+    
+    // =========================================================================
+    // Locked Shares Methods (for Sell Order Support)
+    // =========================================================================
+    
+    /// Get available YES tokens (total - locked)
+    #[inline]
+    pub fn available_yes(&self) -> u64 {
+        self.yes_amount.saturating_sub(self.yes_locked)
+    }
+    
+    /// Get available NO tokens (total - locked)
+    #[inline]
+    pub fn available_no(&self) -> u64 {
+        self.no_amount.saturating_sub(self.no_locked)
+    }
+    
+    /// Get available tokens for a specific outcome
+    pub fn available(&self, outcome: Outcome) -> u64 {
+        match outcome {
+            Outcome::Yes => self.available_yes(),
+            Outcome::No => self.available_no(),
+        }
+    }
+    
+    /// Get locked tokens for a specific outcome
+    pub fn locked(&self, outcome: Outcome) -> u64 {
+        match outcome {
+            Outcome::Yes => self.yes_locked,
+            Outcome::No => self.no_locked,
+        }
+    }
+    
+    /// Lock shares for a Sell order
+    /// 
+    /// Returns Ok(()) if successful, Err if insufficient available shares
+    pub fn lock_shares(&mut self, outcome: Outcome, amount: u64) -> Result<(), ()> {
+        let available = self.available(outcome);
+        if available < amount {
+            return Err(());
+        }
+        
+        match outcome {
+            Outcome::Yes => self.yes_locked += amount,
+            Outcome::No => self.no_locked += amount,
+        }
+        
+        Ok(())
+    }
+    
+    /// Unlock shares when a Sell order is cancelled
+    /// 
+    /// Returns Ok(()) if successful, Err if trying to unlock more than locked
+    pub fn unlock_shares(&mut self, outcome: Outcome, amount: u64) -> Result<(), ()> {
+        let locked = self.locked(outcome);
+        if locked < amount {
+            return Err(());
+        }
+        
+        match outcome {
+            Outcome::Yes => self.yes_locked -= amount,
+            Outcome::No => self.no_locked -= amount,
+        }
+        
+        Ok(())
+    }
+    
+    /// Consume locked shares when a Sell order is filled
+    /// 
+    /// This removes shares from both locked and total amount.
+    /// Used during ExecuteTradeV2 and MatchBurnV2.
+    /// 
+    /// Returns Ok(()) if successful, Err if insufficient locked shares
+    pub fn consume_locked_shares(
+        &mut self,
+        outcome: Outcome,
+        amount: u64,
+        price: u64,
+        current_time: i64,
+    ) -> Result<(), ()> {
+        let locked = self.locked(outcome);
+        if locked < amount {
+            return Err(());
+        }
+        
+        // Unlock first
+        match outcome {
+            Outcome::Yes => self.yes_locked -= amount,
+            Outcome::No => self.no_locked -= amount,
+        }
+        
+        // Then remove from total (this also updates realized PnL)
+        self.remove_tokens(outcome, amount, price, current_time);
+        
+        Ok(())
     }
 }
 

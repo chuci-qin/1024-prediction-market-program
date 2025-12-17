@@ -2483,11 +2483,15 @@ fn process_match_burn_v2(
     let mut yes_position = deserialize_account::<Position>(&yes_position_info.data.borrow())?;
     let mut no_position = deserialize_account::<Position>(&no_position_info.data.borrow())?;
     
-    // Verify sellers have sufficient position
-    if yes_position.yes_amount < match_amount {
+    // Verify sellers have sufficient LOCKED shares (locked when Sell order was placed)
+    if yes_position.yes_locked < match_amount {
+        msg!("Error: YES seller has insufficient locked shares: {} < {}", 
+             yes_position.yes_locked, match_amount);
         return Err(PredictionMarketError::InsufficientPosition.into());
     }
-    if no_position.no_amount < match_amount {
+    if no_position.no_locked < match_amount {
+        msg!("Error: NO seller has insufficient locked shares: {} < {}", 
+             no_position.no_locked, match_amount);
         return Err(PredictionMarketError::InsufficientPosition.into());
     }
     
@@ -2527,12 +2531,22 @@ fn process_match_burn_v2(
         config_seeds,
     )?;
     
-    // Step 3: Update positions
-    yes_position.remove_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
+    // Step 3: Update positions - consume locked shares (unlock + remove)
+    yes_position.consume_locked_shares(Outcome::Yes, match_amount, args.yes_price, current_time)
+        .map_err(|_| {
+            msg!("Error: Failed to consume YES locked shares");
+            PredictionMarketError::InsufficientPosition
+        })?;
     yes_position.serialize(&mut *yes_position_info.data.borrow_mut())?;
     
-    no_position.remove_tokens(Outcome::No, match_amount, args.no_price, current_time);
+    no_position.consume_locked_shares(Outcome::No, match_amount, args.no_price, current_time)
+        .map_err(|_| {
+            msg!("Error: Failed to consume NO locked shares");
+            PredictionMarketError::InsufficientPosition
+        })?;
     no_position.serialize(&mut *no_position_info.data.borrow_mut())?;
+    
+    msg!("📊 Burned {} complete sets (YES + NO)", match_amount);
     
     // Step 4: Update orders
     yes_order.filled_amount = safe_add_u64(yes_order.filled_amount, match_amount)?;
@@ -2916,20 +2930,25 @@ fn process_execute_trade_v2(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    // Load seller position to verify sufficient shares
+    // Load seller position to verify sufficient LOCKED shares
+    // In V2, shares are locked when placing a Sell order via RelayerPlaceOrderV2
     let mut seller_position = deserialize_account::<Position>(&seller_position_info.data.borrow())?;
     if seller_position.discriminator != POSITION_DISCRIMINATOR {
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
     
-    // Check seller has sufficient shares for the outcome
-    let seller_shares = match outcome {
-        Outcome::Yes => seller_position.yes_amount,
-        Outcome::No => seller_position.no_amount,
-    };
+    // Check seller has sufficient LOCKED shares for this trade
+    // The shares should have been locked when the Sell order was placed
+    let seller_locked = seller_position.locked(outcome);
     
-    if seller_shares < match_amount {
-        msg!("Error: Seller has insufficient shares: {} < {}", seller_shares, match_amount);
+    if seller_locked < match_amount {
+        msg!("Error: Seller has insufficient locked shares: {} < {} (total: {}, locked: {})", 
+             seller_locked, match_amount,
+             match outcome {
+                 Outcome::Yes => seller_position.yes_amount,
+                 Outcome::No => seller_position.no_amount,
+             },
+             seller_locked);
         return Err(PredictionMarketError::InsufficientPosition.into());
     }
     
@@ -2971,8 +2990,8 @@ fn process_execute_trade_v2(
         config_seeds,
     )?;
     
-    // Step 3: Update Positions - transfer shares
-    // Load or initialize buyer position
+    // Step 3: Update Positions - transfer shares (seller → buyer)
+    // Load buyer position
     let mut buyer_position = if buyer_position_info.data_len() > 0 {
         deserialize_account::<Position>(&buyer_position_info.data.borrow())?
     } else {
@@ -2980,23 +2999,22 @@ fn process_execute_trade_v2(
         return Err(PredictionMarketError::PositionNotFound.into());
     };
     
-    // Transfer shares
-    match outcome {
-        Outcome::Yes => {
-            seller_position.yes_amount = seller_position.yes_amount.saturating_sub(match_amount);
-            buyer_position.yes_amount = buyer_position.yes_amount.saturating_add(match_amount);
-        }
-        Outcome::No => {
-            seller_position.no_amount = seller_position.no_amount.saturating_sub(match_amount);
-            buyer_position.no_amount = buyer_position.no_amount.saturating_add(match_amount);
-        }
-    }
+    // Consume locked shares from seller (this unlocks and removes in one step)
+    // Note: For Direct Trade, seller doesn't receive USDC here (handled by CPI above)
+    // We use exec_price for PnL calculation
+    seller_position.consume_locked_shares(outcome, match_amount, exec_price, current_time)
+        .map_err(|_| {
+            msg!("Error: Failed to consume locked shares from seller");
+            PredictionMarketError::InsufficientPosition
+        })?;
     
-    seller_position.updated_at = current_time;
-    buyer_position.updated_at = current_time;
+    // Add shares to buyer
+    buyer_position.add_tokens(outcome, match_amount, exec_price, current_time);
     
     seller_position.serialize(&mut *seller_position_info.data.borrow_mut())?;
     buyer_position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+    
+    msg!("📊 Shares transferred: {} {:?} from seller to buyer", match_amount, outcome);
     
     // Step 4: Update Orders
     buy_order.filled_amount += match_amount;
@@ -3452,15 +3470,15 @@ fn process_match_burn_multi_v2(
             return Err(PredictionMarketError::InvalidAccountData.into());
         }
         
-        // Verify seller has sufficient holdings
+        // Verify seller has sufficient LOCKED holdings (locked when Sell order was placed)
         let holding_idx = expected_outcome_idx as usize;
         if holding_idx >= position.holdings.len() {
             return Err(PredictionMarketError::InvalidOutcome.into());
         }
         
-        if position.holdings[holding_idx] < match_amount {
-            msg!("Error: Seller has insufficient holdings: {} < {}", 
-                 position.holdings[holding_idx], match_amount);
+        if position.locked[holding_idx] < match_amount {
+            msg!("Error: Seller has insufficient locked holdings: {} < {} (total: {})", 
+                 position.locked[holding_idx], match_amount, position.holdings[holding_idx]);
             return Err(PredictionMarketError::InsufficientPosition.into());
         }
         
@@ -3483,10 +3501,12 @@ fn process_match_burn_multi_v2(
             config_seeds,
         )?;
         
-        // Update position: reduce holdings
-        position.holdings[holding_idx] = position.holdings[holding_idx].saturating_sub(match_amount);
-        position.realized_pnl = position.realized_pnl.saturating_add(seller_proceeds as i64);
-        position.updated_at = current_time;
+        // Update position: consume locked shares (unlock + reduce holdings)
+        position.consume_locked_shares(expected_outcome_idx, match_amount, price, current_time)
+            .map_err(|_| {
+                msg!("Error: Failed to consume locked shares for outcome {}", expected_outcome_idx);
+                PredictionMarketError::InsufficientPosition
+            })?;
         position.serialize(&mut *position_info.data.borrow_mut())?;
         
         // Update order
@@ -3637,21 +3657,34 @@ fn process_relayer_place_order_v2(
             config_seeds,
         )?;
     } else {
-        // For Sell orders: Verify Position has sufficient holdings
-        let position = deserialize_account::<Position>(&position_info.data.borrow())?;
+        // For Sell orders: Verify Position has sufficient AVAILABLE holdings and LOCK them
+        let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
         if position.discriminator != POSITION_DISCRIMINATOR {
             return Err(PredictionMarketError::InvalidAccountData.into());
         }
         
-        let holdings = match args.outcome {
-            Outcome::Yes => position.yes_amount,
-            Outcome::No => position.no_amount,
-        };
+        // Check available (total - locked), not just total
+        let available = position.available(args.outcome);
         
-        if holdings < args.amount {
-            msg!("Error: Insufficient holdings: {} < {}", holdings, args.amount);
+        if available < args.amount {
+            msg!("Error: Insufficient available holdings: {} < {} (total: {}, locked: {})", 
+                 available, args.amount,
+                 match args.outcome {
+                     Outcome::Yes => position.yes_amount,
+                     Outcome::No => position.no_amount,
+                 },
+                 position.locked(args.outcome));
             return Err(PredictionMarketError::InsufficientPosition.into());
         }
+        
+        // Lock shares for this Sell order
+        position.lock_shares(args.outcome, args.amount)
+            .map_err(|_| PredictionMarketError::InsufficientPosition)?;
+        
+        position.updated_at = current_time;
+        position.serialize(&mut *position_info.data.borrow_mut())?;
+        
+        msg!("📊 Position locked: {} {:?} shares", args.amount, args.outcome);
     }
     
     // Get outcome index
@@ -3787,19 +3820,22 @@ fn process_relayer_cancel_order_v2(
         return Err(PredictionMarketError::OrderNotActive.into());
     }
     
-    // Account 4: User Vault Account
+    // Account 4: Position PDA (for Sell order share unlock)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: User Vault Account
     let user_vault_info = next_account_info(account_info_iter)?;
     
-    // Account 5: PM User Account
+    // Account 6: PM User Account
     let pm_user_info = next_account_info(account_info_iter)?;
     
-    // Account 6: Vault Config
+    // Account 7: Vault Config
     let vault_config_info = next_account_info(account_info_iter)?;
     
-    // Account 7: Vault Program
+    // Account 8: Vault Program
     let vault_program_info = next_account_info(account_info_iter)?;
     
-    // Account 8: System Program
+    // Account 9: System Program
     let _system_program_info = next_account_info(account_info_iter)?;
     
     // Calculate remaining margin to unlock (in e6 precision)
@@ -3824,18 +3860,52 @@ fn process_relayer_cancel_order_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // For Buy orders: Unlock remaining margin from Vault
-    if order.side == crate::state::OrderSide::Buy && remaining_margin > 0 {
-        msg!("CPI: Unlock remaining margin {} for cancelled Buy order", remaining_margin);
-        cpi_release_from_prediction(
-            vault_program_info,
-            vault_config_info,
-            user_vault_info,
-            pm_user_info,
-            config_info,
-            remaining_margin,
-            config_seeds,
-        )?;
+    // Handle order cancellation based on side
+    if order.side == crate::state::OrderSide::Buy {
+        // For Buy orders: Unlock remaining margin from Vault
+        if remaining_margin > 0 {
+            msg!("CPI: Unlock remaining margin {} for cancelled Buy order", remaining_margin);
+            cpi_release_from_prediction(
+                vault_program_info,
+                vault_config_info,
+                user_vault_info,
+                pm_user_info,
+                config_info,
+                remaining_margin,
+                config_seeds,
+            )?;
+        }
+    } else {
+        // For Sell orders: Unlock remaining shares from Position
+        if remaining > 0 {
+            // Verify Position PDA
+            let (position_pda, _) = Pubkey::find_program_address(
+                &[POSITION_SEED, &market_id_bytes, order.owner.as_ref()],
+                program_id,
+            );
+            
+            if *position_info.key != position_pda {
+                msg!("Error: Invalid Position PDA for Sell order cancellation");
+                return Err(PredictionMarketError::InvalidPDA.into());
+            }
+            
+            let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+            if position.discriminator != POSITION_DISCRIMINATOR {
+                return Err(PredictionMarketError::InvalidAccountData.into());
+            }
+            
+            // Unlock the remaining locked shares
+            position.unlock_shares(order.outcome, remaining)
+                .map_err(|_| {
+                    msg!("Error: Failed to unlock shares - locked amount mismatch");
+                    PredictionMarketError::InsufficientPosition
+                })?;
+            
+            position.updated_at = current_time;
+            position.serialize(&mut *position_info.data.borrow_mut())?;
+            
+            msg!("📊 Position unlocked: {} {:?} shares for cancelled Sell order", remaining, order.outcome);
+        }
     }
     
     // Update order status
