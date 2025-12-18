@@ -2323,15 +2323,118 @@ fn process_match_mint_v2(
         config_seeds,
     )?;
     
-    // Step 3: Update YES buyer position
-    let mut yes_position = deserialize_account::<Position>(&yes_position_info.data.borrow())?;
-    yes_position.add_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
-    yes_position.serialize(&mut *yes_position_info.data.borrow_mut())?;
+    // Step 3: Create or update YES buyer position (Auto-init if needed)
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let yes_buyer = yes_order.owner;
+    let (yes_position_pda, yes_position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, yes_buyer.as_ref()],
+        program_id,
+    );
     
-    // Step 4: Update NO buyer position
-    let mut no_position = deserialize_account::<Position>(&no_position_info.data.borrow())?;
-    no_position.add_tokens(Outcome::No, match_amount, args.no_price, current_time);
-    no_position.serialize(&mut *no_position_info.data.borrow_mut())?;
+    if *yes_position_info.key != yes_position_pda {
+        msg!("Error: Invalid YES Position PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let yes_is_new = yes_position_info.data_is_empty();
+    
+    if yes_is_new {
+        // Create new YES Position account
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            POSITION_SEED, 
+            &market_id_bytes, 
+            yes_buyer.as_ref(), 
+            &[yes_position_bump]
+        ];
+        
+        msg!("Creating YES buyer Position account");
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                yes_position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), yes_position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+    }
+    
+    // Update YES position
+    {
+        let mut yes_position_data = yes_position_info.try_borrow_mut_data()?;
+        let mut yes_position = if yes_is_new {
+            Position::new(market.market_id, yes_buyer, yes_position_bump, current_time)
+        } else {
+            let pos = Position::deserialize(&mut &yes_position_data[..])?;
+            if pos.discriminator != POSITION_DISCRIMINATOR {
+                return Err(PredictionMarketError::InvalidAccountData.into());
+            }
+            pos
+        };
+        yes_position.add_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
+        yes_position.serialize(&mut yes_position_data.as_mut())?;
+    }
+    
+    // Step 4: Create or update NO buyer position (Auto-init if needed)
+    let no_buyer = no_order.owner;
+    let (no_position_pda, no_position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, no_buyer.as_ref()],
+        program_id,
+    );
+    
+    if *no_position_info.key != no_position_pda {
+        msg!("Error: Invalid NO Position PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let no_is_new = no_position_info.data_is_empty();
+    
+    if no_is_new {
+        // Create new NO Position account
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            POSITION_SEED, 
+            &market_id_bytes, 
+            no_buyer.as_ref(), 
+            &[no_position_bump]
+        ];
+        
+        msg!("Creating NO buyer Position account");
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                no_position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), no_position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+    }
+    
+    // Update NO position
+    {
+        let mut no_position_data = no_position_info.try_borrow_mut_data()?;
+        let mut no_position = if no_is_new {
+            Position::new(market.market_id, no_buyer, no_position_bump, current_time)
+        } else {
+            let pos = Position::deserialize(&mut &no_position_data[..])?;
+            if pos.discriminator != POSITION_DISCRIMINATOR {
+                return Err(PredictionMarketError::InvalidAccountData.into());
+            }
+            pos
+        };
+        no_position.add_tokens(Outcome::No, match_amount, args.no_price, current_time);
+        no_position.serialize(&mut no_position_data.as_mut())?;
+    }
     
     // Step 5: Update orders
     yes_order.filled_amount = safe_add_u64(yes_order.filled_amount, match_amount)?;
