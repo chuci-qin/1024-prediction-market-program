@@ -2,8 +2,10 @@
 //!
 //! This module provides helpers for calling:
 //! - Vault Program (lock/release funds, settlements)
-//! - Fund Program (fee collection, maker rewards)
 //! - SPL Token Program (mint/burn/transfer tokens)
+//!
+//! NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
+//! rather than via Fund Program CPI from PM Program.
 
 use solana_program::{
     account_info::AccountInfo,
@@ -160,35 +162,67 @@ pub fn cpi_prediction_settle<'a>(
 }
 
 // ============================================================================
-// Fund Program CPI
+// V2 Fee Architecture: Vault CPI with Fee Collection
 // ============================================================================
 
-/// Collect prediction market fee (CPI to Fund Program)
-pub fn cpi_collect_pm_fee<'a>(
-    fund_program: &AccountInfo<'a>,
+/// Lock user funds for prediction market with fee collection (CPI to Vault Program)
+/// 
+/// This is the V2 fee architecture version that:
+/// 1. Deducts gross_amount from UserAccount.available_balance
+/// 2. Reads fee rate from PM Fee Config
+/// 3. Calculates and collects minting fee
+/// 4. Locks net_amount to PMUserAccount
+/// 
+/// Vault Instruction Index: 21 (PredictionMarketLockWithFee)
+/// 
+/// Accounts expected by Vault:
+/// 0. `[]` VaultConfig
+/// 1. `[writable]` UserAccount
+/// 2. `[writable]` PMUserAccount
+/// 3. `[]` Caller Program (PM Config PDA)
+/// 4. `[writable]` Vault Token Account
+/// 5. `[writable]` PM Fee Vault
+/// 6. `[writable]` PM Fee Config PDA
+/// 7. `[]` Token Program
+/// 8. `[signer, writable]` Payer (for auto-init)
+/// 9. `[]` System Program (for auto-init)
+pub fn cpi_lock_for_prediction_with_fee<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    vault_token_account: &AccountInfo<'a>,
+    pm_fee_vault: &AccountInfo<'a>,
     pm_fee_config: &AccountInfo<'a>,
-    fee_fund_vault: &AccountInfo<'a>,
-    source_token_account: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
-    fee_type: u8, // 0: minting, 1: redemption, 2: trading
-    amount: u64,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    gross_amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    msg!("CPI: Collect PM fee - type: {}, amount: {}", fee_type, amount);
+    msg!("CPI: Lock {} with fee for prediction market", gross_amount);
     
-    let mut data = vec![90u8]; // Instruction index for CollectPMFee (placeholder)
-    data.push(fee_type);
-    data.extend_from_slice(&amount.to_le_bytes());
+    // Instruction index for PredictionMarketLockWithFee = 21
+    // (After RelayerDeposit=19, RelayerWithdraw=20)
+    let mut data = vec![21u8];
+    data.extend_from_slice(&gross_amount.to_le_bytes());
     
     let accounts = vec![
+        vault_config.clone(),
+        user_account.clone(),
+        pm_user_account.clone(),
+        caller_program.clone(),
+        vault_token_account.clone(),
+        pm_fee_vault.clone(),
         pm_fee_config.clone(),
-        fee_fund_vault.clone(),
-        source_token_account.clone(),
         token_program.clone(),
+        payer.clone(),
+        system_program.clone(),
     ];
     
     let ix = solana_program::instruction::Instruction {
-        program_id: *fund_program.key,
+        program_id: *vault_program.key,
         accounts: accounts.iter().map(|a| {
             solana_program::instruction::AccountMeta {
                 pubkey: *a.key,
@@ -204,30 +238,168 @@ pub fn cpi_collect_pm_fee<'a>(
     Ok(())
 }
 
-/// Distribute maker reward (CPI to Fund Program)
-pub fn cpi_distribute_maker_reward<'a>(
-    fund_program: &AccountInfo<'a>,
+/// Release user funds from prediction market with fee collection (CPI to Vault Program)
+/// 
+/// V2 fee architecture version that collects redemption fee.
+/// 
+/// Vault Instruction Index: 22 (PredictionMarketUnlockWithFee)
+/// 
+/// Accounts:
+/// 0. `[]` VaultConfig
+/// 1. `[writable]` UserAccount
+/// 2. `[writable]` PMUserAccount
+/// 3. `[]` Caller Program
+/// 4. `[writable]` Vault Token Account
+/// 5. `[writable]` PM Fee Vault
+/// 6. `[writable]` PM Fee Config PDA
+/// 7. `[]` Token Program
+pub fn cpi_release_from_prediction_with_fee<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    vault_token_account: &AccountInfo<'a>,
+    pm_fee_vault: &AccountInfo<'a>,
     pm_fee_config: &AccountInfo<'a>,
-    fee_fund_vault: &AccountInfo<'a>,
-    maker_token_account: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
-    amount: u64,
+    gross_amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    msg!("CPI: Distribute maker reward: {}", amount);
+    msg!("CPI: Release {} with fee from prediction market", gross_amount);
     
-    let mut data = vec![91u8]; // Instruction index (placeholder)
-    data.extend_from_slice(&amount.to_le_bytes());
+    // Instruction index for PredictionMarketUnlockWithFee = 22
+    let mut data = vec![22u8];
+    data.extend_from_slice(&gross_amount.to_le_bytes());
     
     let accounts = vec![
+        vault_config.clone(),
+        user_account.clone(),
+        pm_user_account.clone(),
+        caller_program.clone(),
+        vault_token_account.clone(),
+        pm_fee_vault.clone(),
         pm_fee_config.clone(),
-        fee_fund_vault.clone(),
-        maker_token_account.clone(),
         token_program.clone(),
     ];
     
     let ix = solana_program::instruction::Instruction {
-        program_id: *fund_program.key,
+        program_id: *vault_program.key,
+        accounts: accounts.iter().map(|a| {
+            solana_program::instruction::AccountMeta {
+                pubkey: *a.key,
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            }
+        }).collect(),
+        data,
+    };
+    
+    invoke_signed(&ix, &accounts, &[signer_seeds])?;
+    
+    Ok(())
+}
+
+/// CPI to Vault.PredictionMarketTradeWithFee (index 23)
+/// 
+/// Collects trading fee from a trade. Does not modify user balances.
+/// 
+/// Accounts:
+/// 0. VaultConfig
+/// 1. Caller Program
+/// 2. Vault Token Account
+/// 3. PM Fee Vault
+/// 4. PM Fee Config
+/// 5. Token Program
+pub fn cpi_trade_with_fee<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    vault_token_account: &AccountInfo<'a>,
+    pm_fee_vault: &AccountInfo<'a>,
+    pm_fee_config: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    trade_amount: u64,
+    is_taker: bool,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    msg!("CPI: Trade fee for amount={}, is_taker={}", trade_amount, is_taker);
+    
+    // Instruction index for PredictionMarketTradeWithFee = 23
+    let mut data = vec![23u8];
+    data.extend_from_slice(&trade_amount.to_le_bytes());
+    data.push(if is_taker { 1 } else { 0 });
+    
+    let accounts = vec![
+        vault_config.clone(),
+        caller_program.clone(),
+        vault_token_account.clone(),
+        pm_fee_vault.clone(),
+        pm_fee_config.clone(),
+        token_program.clone(),
+    ];
+    
+    let ix = solana_program::instruction::Instruction {
+        program_id: *vault_program.key,
+        accounts: accounts.iter().map(|a| {
+            solana_program::instruction::AccountMeta {
+                pubkey: *a.key,
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            }
+        }).collect(),
+        data,
+    };
+    
+    invoke_signed(&ix, &accounts, &[signer_seeds])?;
+    
+    Ok(())
+}
+
+/// CPI to Vault.PredictionMarketSettleWithFee (index 24)
+/// 
+/// Settles market position with fee deduction.
+/// 
+/// Accounts:
+/// 0. VaultConfig
+/// 1. PredictionMarketUserAccount
+/// 2. Caller Program
+/// 3. Vault Token Account
+/// 4. PM Fee Vault
+/// 5. PM Fee Config
+/// 6. Token Program
+pub fn cpi_settle_with_fee<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    vault_token_account: &AccountInfo<'a>,
+    pm_fee_vault: &AccountInfo<'a>,
+    pm_fee_config: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    locked_amount: u64,
+    settlement_amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    msg!("CPI: Settle with fee locked={}, settlement={}", locked_amount, settlement_amount);
+    
+    // Instruction index for PredictionMarketSettleWithFee = 24
+    let mut data = vec![24u8];
+    data.extend_from_slice(&locked_amount.to_le_bytes());
+    data.extend_from_slice(&settlement_amount.to_le_bytes());
+    
+    let accounts = vec![
+        vault_config.clone(),
+        pm_user_account.clone(),
+        caller_program.clone(),
+        vault_token_account.clone(),
+        pm_fee_vault.clone(),
+        pm_fee_config.clone(),
+        token_program.clone(),
+    ];
+    
+    let ix = solana_program::instruction::Instruction {
+        program_id: *vault_program.key,
         accounts: accounts.iter().map(|a| {
             solana_program::instruction::AccountMeta {
                 pubkey: *a.key,
@@ -405,4 +577,3 @@ mod tests {
         assert!(verify_token_program(&Pubkey::new_unique()).is_err());
     }
 }
-

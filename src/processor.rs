@@ -23,7 +23,7 @@ use crate::state::{
     MARKET_VAULT_SEED, YES_MINT_SEED, NO_MINT_SEED, ORACLE_PROPOSAL_SEED, OUTCOME_MINT_SEED,
     PM_CONFIG_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORDER_DISCRIMINATOR, 
     POSITION_DISCRIMINATOR, ORACLE_PROPOSAL_DISCRIMINATOR,
-    PRICE_PRECISION, MIN_PRICE, MAX_PRICE,
+    PRICE_PRECISION, MIN_PRICE, MAX_PRICE, MAX_OUTCOMES,
 };
 use crate::utils::{
     check_signer, get_current_timestamp,
@@ -35,6 +35,10 @@ use crate::cpi::{
     cpi_lock_for_prediction,
     cpi_release_from_prediction,
     cpi_prediction_settle,
+    cpi_lock_for_prediction_with_fee,
+    cpi_release_from_prediction_with_fee,
+    cpi_trade_with_fee,
+    cpi_settle_with_fee,
 };
 
 /// Process an instruction
@@ -171,9 +175,9 @@ pub fn process_instruction(
         }
         
         // Multi-Outcome Market Instructions
-        PredictionMarketInstruction::CreateMultiOutcomeMarket(_) => {
-            msg!("⚠️ CreateMultiOutcomeMarket: Use deployed V7 program");
-            Err(ProgramError::InvalidInstructionData)
+        PredictionMarketInstruction::CreateMultiOutcomeMarket(args) => {
+            msg!("Instruction: CreateMultiOutcomeMarket");
+            process_create_multi_outcome_market(program_id, accounts, args)
         }
         PredictionMarketInstruction::MintMultiOutcomeCompleteSet(_) => {
             msg!("⚠️ MintMultiOutcomeCompleteSet: Use deployed V7 program");
@@ -297,6 +301,16 @@ pub fn process_instruction(
         PredictionMarketInstruction::RelayerCancelOrderV2(args) => {
             msg!("Instruction: RelayerCancelOrderV2");
             process_relayer_cancel_order_v2(program_id, accounts, args)
+        }
+        
+        // V2 WithFee Instructions
+        PredictionMarketInstruction::RelayerMintCompleteSetV2WithFee(args) => {
+            msg!("Instruction: RelayerMintCompleteSetV2WithFee");
+            process_relayer_mint_complete_set_v2_with_fee(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRedeemCompleteSetV2WithFee(args) => {
+            msg!("Instruction: RelayerRedeemCompleteSetV2WithFee");
+            process_relayer_redeem_complete_set_v2_with_fee(program_id, accounts, args)
         }
     }
 }
@@ -763,6 +777,293 @@ fn process_create_market(
     Ok(())
 }
 
+/// Create a multi-outcome prediction market
+/// 
+/// Account layout:
+/// 0. `[signer]` Creator
+/// 1. `[writable]` PredictionMarketConfig
+/// 2. `[writable]` Market PDA
+/// 3. `[writable]` Market Vault PDA
+/// 4. `[]` USDC Mint
+/// 5. `[]` Token Program
+/// 6. `[]` System Program
+/// 7. `[]` Rent Sysvar
+/// 8..8+n. `[writable]` Outcome Token Mints (n outcomes)
+fn process_create_multi_outcome_market(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: CreateMultiOutcomeMarketArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Creator (signer)
+    let creator_info = next_account_info(account_info_iter)?;
+    check_signer(creator_info)?;
+    
+    // Account 1: PredictionMarketConfig (writable)
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market PDA (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Market Vault PDA (writable)
+    let market_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: USDC Mint
+    let usdc_mint_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Rent Sysvar
+    let rent_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        msg!("Error: Invalid PredictionMarketConfig discriminator");
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        msg!("Error: Program is paused");
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Validate USDC mint matches config
+    if *usdc_mint_info.key != config.usdc_mint {
+        msg!("Error: USDC Mint mismatch");
+        return Err(PredictionMarketError::InvalidUSDCMint.into());
+    }
+    
+    // Validate num_outcomes (2-32)
+    if args.num_outcomes < 2 || args.num_outcomes as usize > MAX_OUTCOMES {
+        msg!("Error: num_outcomes must be between 2 and {}", MAX_OUTCOMES);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate outcome_hashes length matches num_outcomes
+    if args.outcome_hashes.len() != args.num_outcomes as usize {
+        msg!("Error: outcome_hashes length ({}) != num_outcomes ({})", 
+             args.outcome_hashes.len(), args.num_outcomes);
+        return Err(PredictionMarketError::InvalidArgument.into());
+    }
+    
+    // Validate market parameters
+    let current_time = get_current_timestamp()?;
+    if args.resolution_time <= current_time {
+        msg!("Error: Resolution time must be in the future");
+        return Err(PredictionMarketError::InvalidResolutionTime.into());
+    }
+    
+    if args.finalization_deadline <= args.resolution_time {
+        msg!("Error: Finalization deadline must be after resolution time");
+        return Err(PredictionMarketError::InvalidFinalizationDeadline.into());
+    }
+    
+    if args.creator_fee_bps > 500 {
+        msg!("Error: Creator fee cannot exceed 5%");
+        return Err(PredictionMarketError::CreatorFeeTooHigh.into());
+    }
+    
+    // Allocate market_id
+    let market_id = config.next_market_id;
+    let market_id_bytes = market_id.to_le_bytes();
+    
+    // Verify Market PDA
+    let (market_pda, market_bump) = Pubkey::find_program_address(
+        &[MARKET_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *market_info.key != market_pda {
+        msg!("Error: Invalid Market PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Verify Market Vault PDA
+    let (market_vault_pda, market_vault_bump) = Pubkey::find_program_address(
+        &[MARKET_VAULT_SEED, &market_id_bytes],
+        program_id,
+    );
+    if *market_vault_info.key != market_vault_pda {
+        msg!("Error: Invalid Market Vault PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let rent = Rent::get()?;
+    
+    // Create Market account
+    let market_space = Market::SIZE;
+    let market_lamports = rent.minimum_balance(market_space);
+    let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            creator_info.key,
+            market_info.key,
+            market_lamports,
+            market_space as u64,
+            program_id,
+        ),
+        &[creator_info.clone(), market_info.clone(), system_program_info.clone()],
+        &[market_seeds],
+    )?;
+    
+    // Create Market Vault (USDC Token Account)
+    let vault_space = spl_token::state::Account::LEN;
+    let vault_lamports = rent.minimum_balance(vault_space);
+    let vault_seeds: &[&[u8]] = &[MARKET_VAULT_SEED, &market_id_bytes, &[market_vault_bump]];
+    
+    invoke_signed(
+        &system_instruction::create_account(
+            creator_info.key,
+            market_vault_info.key,
+            vault_lamports,
+            vault_space as u64,
+            token_program_info.key,
+        ),
+        &[creator_info.clone(), market_vault_info.clone(), system_program_info.clone()],
+        &[vault_seeds],
+    )?;
+    
+    // Initialize Market Vault (owner = Market PDA)
+    invoke_signed(
+        &spl_token::instruction::initialize_account(
+            token_program_info.key,
+            market_vault_info.key,
+            usdc_mint_info.key,
+            market_info.key, // owner = Market PDA
+        )?,
+        &[
+            market_vault_info.clone(),
+            usdc_mint_info.clone(),
+            market_info.clone(),
+            rent_info.clone(),
+        ],
+        &[vault_seeds],
+    )?;
+    
+    // Create and initialize outcome token mints
+    let mint_space = spl_token::state::Mint::LEN;
+    let mint_lamports = rent.minimum_balance(mint_space);
+    
+    // We'll collect the first outcome mint as yes_mint and second as no_mint for compatibility
+    // (even though multi-outcome markets don't really use yes/no terminology)
+    let mut first_outcome_mint = Pubkey::default();
+    let mut second_outcome_mint = Pubkey::default();
+    
+    for outcome_index in 0..args.num_outcomes {
+        let outcome_index_bytes = [outcome_index];
+        
+        // Derive Outcome Mint PDA
+        let (outcome_mint_pda, outcome_mint_bump) = Pubkey::find_program_address(
+            &[OUTCOME_MINT_SEED, &market_id_bytes, &outcome_index_bytes],
+            program_id,
+        );
+        
+        // Get the account info for this outcome mint (from remaining accounts)
+        let outcome_mint_info = next_account_info(account_info_iter)?;
+        if *outcome_mint_info.key != outcome_mint_pda {
+            msg!("Error: Invalid Outcome Mint PDA for outcome {}", outcome_index);
+            return Err(PredictionMarketError::InvalidPDA.into());
+        }
+        
+        // Create Outcome Mint account
+        let outcome_mint_seeds: &[&[u8]] = &[
+            OUTCOME_MINT_SEED, 
+            &market_id_bytes, 
+            &outcome_index_bytes, 
+            &[outcome_mint_bump]
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                creator_info.key,
+                outcome_mint_info.key,
+                mint_lamports,
+                mint_space as u64,
+                token_program_info.key,
+            ),
+            &[creator_info.clone(), outcome_mint_info.clone(), system_program_info.clone()],
+            &[outcome_mint_seeds],
+        )?;
+        
+        // Initialize Outcome Mint (authority = Market PDA)
+        invoke_signed(
+            &spl_token::instruction::initialize_mint(
+                token_program_info.key,
+                outcome_mint_info.key,
+                market_info.key, // mint_authority
+                Some(market_info.key), // freeze_authority
+                6, // decimals (same as USDC)
+            )?,
+            &[
+                outcome_mint_info.clone(),
+                rent_info.clone(),
+            ],
+            &[outcome_mint_seeds],
+        )?;
+        
+        // Store first two outcome mints for compatibility with binary market fields
+        if outcome_index == 0 {
+            first_outcome_mint = *outcome_mint_info.key;
+        } else if outcome_index == 1 {
+            second_outcome_mint = *outcome_mint_info.key;
+        }
+        
+        msg!("Created Outcome {} Mint: {}", outcome_index, outcome_mint_info.key);
+    }
+    
+    // Initialize market data
+    let market = Market {
+        discriminator: MARKET_DISCRIMINATOR,
+        market_id,
+        market_type: MarketType::MultiOutcome, // Multi-outcome market
+        num_outcomes: args.num_outcomes,
+        creator: *creator_info.key,
+        question_hash: args.question_hash,
+        resolution_spec_hash: args.resolution_spec_hash,
+        yes_mint: first_outcome_mint, // First outcome mint for compatibility
+        no_mint: second_outcome_mint, // Second outcome mint for compatibility
+        market_vault: *market_vault_info.key,
+        status: MarketStatus::Pending, // Starts as Pending, admin needs to activate
+        review_status: ReviewStatus::None,
+        resolution_time: args.resolution_time,
+        finalization_deadline: args.finalization_deadline,
+        final_result: None,
+        winning_outcome_index: None,
+        created_at: current_time,
+        updated_at: current_time,
+        total_minted: 0,
+        total_volume_e6: 0,
+        open_interest: 0,
+        creator_fee_bps: args.creator_fee_bps,
+        next_order_id: 1,
+        bump: market_bump,
+        reserved: [0u8; 60],
+    };
+    
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // Update config
+    config.next_market_id += 1;
+    config.total_markets += 1;
+    config.serialize(&mut *config_info.data.borrow_mut())?;
+    
+    msg!("✅ Multi-outcome market created successfully");
+    msg!("Market ID: {}", market_id);
+    msg!("Creator: {}", creator_info.key);
+    msg!("Num Outcomes: {}", args.num_outcomes);
+    msg!("Market Vault: {}", market_vault_info.key);
+    msg!("Resolution Time: {}", args.resolution_time);
+    msg!("Creator Fee: {} bps", args.creator_fee_bps);
+    
+    Ok(())
+}
+
 fn process_activate_market(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1169,6 +1470,9 @@ fn process_mint_complete_set(
     let market_id_bytes = market.market_id.to_le_bytes();
     let market_seeds: &[&[u8]] = &[MARKET_SEED, &market_id_bytes, &[market.bump]];
     
+    // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
+    // This V1 instruction does not collect fees
+    
     // Transfer USDC from user to market vault
     invoke(
         &spl_token::instruction::transfer(
@@ -1427,6 +1731,9 @@ fn process_redeem_complete_set(
         &[user_no_info.clone(), no_mint_info.clone(), user_info.clone(), token_program_info.clone()],
     )?;
     
+    // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
+    // This V1 instruction does not collect fees
+    
     // Transfer USDC from market vault to user
     invoke_signed(
         &spl_token::instruction::transfer(
@@ -1453,7 +1760,7 @@ fn process_redeem_complete_set(
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
     msg!("Redeemed complete set successfully");
-    msg!("Amount: {} (YES + NO)", args.amount);
+    msg!("Amount: {}", args.amount);
     msg!("User: {}", user_info.key);
     msg!("Market ID: {}", market.market_id);
     
@@ -2461,6 +2768,59 @@ fn process_match_mint_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
+    // Step 7: Optional Fee Collection (V2.1 architecture)
+    // If fee accounts are provided, collect trading fees
+    // Account 14: Vault Token Account (optional)
+    // Account 15: PM Fee Vault (optional)
+    // Account 16: PM Fee Config (optional)
+    // Account 17: Token Program (optional)
+    let vault_token_account = next_account_info(account_info_iter).ok();
+    let pm_fee_vault = next_account_info(account_info_iter).ok();
+    let pm_fee_config = next_account_info(account_info_iter).ok();
+    let token_program = next_account_info(account_info_iter).ok();
+    
+    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
+        msg!("Fee accounts detected, collecting trading fees...");
+        
+        let (config_pda, config_bump) = Pubkey::find_program_address(
+            &[PM_CONFIG_SEED],
+            program_id,
+        );
+        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+        
+        // Collect Taker fee from YES buyer
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            yes_cost,
+            true, // is_taker
+            config_seeds,
+        );
+        
+        // Collect Taker fee from NO buyer  
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            no_cost,
+            true, // is_taker
+            config_seeds,
+        );
+        
+        msg!("✅ Trading fees collected for MatchMintV2");
+    } else {
+        msg!("Fee accounts not provided, skipping fee collection");
+    }
+    
     msg!("✅ MatchMintV2 completed");
     msg!("Amount: {}", match_amount);
     msg!("YES cost: {}, NO cost: {}", yes_cost, no_cost);
@@ -2676,6 +3036,55 @@ fn process_match_burn_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
+    // Step 6: Optional Fee Collection (V2.1 architecture)
+    // If fee accounts are provided, collect trading fees
+    let vault_token_account = next_account_info(account_info_iter).ok();
+    let pm_fee_vault = next_account_info(account_info_iter).ok();
+    let pm_fee_config = next_account_info(account_info_iter).ok();
+    let token_program = next_account_info(account_info_iter).ok();
+    
+    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
+        msg!("Fee accounts detected, collecting trading fees...");
+        
+        let (config_pda, config_bump) = Pubkey::find_program_address(
+            &[PM_CONFIG_SEED],
+            program_id,
+        );
+        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+        
+        // Collect Maker fee from YES seller
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            yes_proceeds,
+            false, // is_maker
+            config_seeds,
+        );
+        
+        // Collect Maker fee from NO seller
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            no_proceeds,
+            false, // is_maker
+            config_seeds,
+        );
+        
+        msg!("✅ Trading fees collected for MatchBurnV2");
+    } else {
+        msg!("Fee accounts not provided, skipping fee collection");
+    }
+    
     msg!("✅ MatchBurnV2 completed");
     msg!("Amount: {}", match_amount);
     msg!("YES proceeds: {}, NO proceeds: {}", yes_proceeds, no_proceeds);
@@ -2802,18 +3211,58 @@ fn process_relayer_claim_winnings_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // CPI to Vault - PredictionMarketSettle
-    msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
-         locked_amount, settlement_amount);
-    cpi_prediction_settle(
-        vault_program_info,
-        vault_config_info,
-        pm_user_account_info,
-        config_info,
-        locked_amount,
-        settlement_amount,
-        config_seeds,
-    )?;
+    // Check for optional fee accounts
+    // Account 8: Vault Token Account (optional)
+    // Account 9: PM Fee Vault (optional)
+    // Account 10: PM Fee Config (optional)
+    // Account 11: Token Program (optional)
+    let vault_token_account = next_account_info(account_info_iter).ok();
+    let pm_fee_vault = next_account_info(account_info_iter).ok();
+    let pm_fee_config = next_account_info(account_info_iter).ok();
+    let token_program = next_account_info(account_info_iter).ok();
+    
+    let use_fee_settlement = vault_token_account.is_some() 
+        && pm_fee_vault.is_some() 
+        && pm_fee_config.is_some() 
+        && token_program.is_some();
+    
+    if use_fee_settlement {
+        // Use settle with fee CPI
+        let vta = vault_token_account.unwrap();
+        let pfv = pm_fee_vault.unwrap();
+        let pfc = pm_fee_config.unwrap();
+        let tp = token_program.unwrap();
+        
+        msg!("CPI: Vault.PredictionMarketSettleWithFee locked={}, settlement={}", 
+             locked_amount, settlement_amount);
+        cpi_settle_with_fee(
+            vault_program_info,
+            vault_config_info,
+            pm_user_account_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            locked_amount,
+            settlement_amount,
+            config_seeds,
+        )?;
+        msg!("✅ Settlement with fee collection completed");
+    } else {
+        // Use regular settle CPI (no fee)
+        msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
+             locked_amount, settlement_amount);
+        cpi_prediction_settle(
+            vault_program_info,
+            vault_config_info,
+            pm_user_account_info,
+            config_info,
+            locked_amount,
+            settlement_amount,
+            config_seeds,
+        )?;
+    }
     
     // Update Position
     let pnl = (settlement_amount as i64) - (locked_amount as i64);
@@ -3143,6 +3592,52 @@ fn process_execute_trade_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
+    // Step 6: Optional Fee Collection (V2.1 architecture)
+    let vault_token_account = next_account_info(account_info_iter).ok();
+    let pm_fee_vault = next_account_info(account_info_iter).ok();
+    let pm_fee_config = next_account_info(account_info_iter).ok();
+    let token_program = next_account_info(account_info_iter).ok();
+    
+    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
+        msg!("Fee accounts detected, collecting trading fees...");
+        
+        let (config_pda, config_bump) = Pubkey::find_program_address(
+            &[PM_CONFIG_SEED],
+            program_id,
+        );
+        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+        
+        // Collect Taker fee from buyer
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            trade_cost,
+            true, // Taker (buyer)
+            config_seeds,
+        );
+        
+        // Collect Maker fee from seller
+        let _ = cpi_trade_with_fee(
+            vault_program_info,
+            vault_config_info,
+            config_info,
+            vta,
+            pfv,
+            pfc,
+            tp,
+            trade_cost,
+            false, // Maker (seller)
+            config_seeds,
+        );
+        
+        msg!("✅ Trading fees collected for ExecuteTradeV2");
+    }
+    
     // Emit success log
     msg!("✅ ExecuteTradeV2 completed");
     msg!("Market: {}, Outcome: {:?}", args.market_id, outcome);
@@ -3405,6 +3900,8 @@ fn process_match_mint_multi_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
+    // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
+    
     msg!("✅ MatchMintMultiV2 completed");
     msg!("Market: {}, Outcomes: {}", args.market_id, args.num_outcomes);
     msg!("Amount: {}, Total Price: {}", match_amount, total_price);
@@ -3631,6 +4128,8 @@ fn process_match_burn_multi_v2(
     market.total_volume_e6 = market.total_volume_e6.saturating_add((match_amount as i64) * (total_price as i64) / 1_000_000);
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
     
     msg!("✅ MatchBurnMultiV2 completed");
     msg!("Market: {}, Outcomes: {}", args.market_id, args.num_outcomes);
@@ -4024,6 +4523,433 @@ fn process_relayer_cancel_order_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Order ID: {}, Market: {}", args.order_id, args.market_id);
     msg!("Remaining amount: {}, Unlocked margin: {}", remaining, remaining_margin);
+    
+    Ok(())
+}
+
+// ============================================================================
+// V2 WithFee Instructions
+// ============================================================================
+
+/// Process RelayerMintCompleteSetV2WithFee
+/// 
+/// Same as RelayerMintCompleteSetV2 but uses Vault.PredictionMarketLockWithFee
+/// to collect minting fee during the lock operation.
+/// 
+/// Accounts:
+/// 0. `[signer]` Relayer
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` Position PDA
+/// 4. `[writable]` User Vault Account
+/// 5. `[writable]` PM User Account
+/// 6. `[]` Vault Config
+/// 7. `[]` Vault Program
+/// 8. `[]` System Program
+/// 9. `[writable]` Vault Token Account
+/// 10. `[writable]` PM Fee Vault
+/// 11. `[writable]` PM Fee Config PDA
+/// 12. `[]` Token Program
+fn process_relayer_mint_complete_set_v2_with_fee(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMintCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Vault Account (writable)
+    let user_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PM User Account (writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: Vault Token Account (for fee transfer)
+    let vault_token_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: PM Fee Vault
+    let pm_fee_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: PM Fee Config PDA
+    let pm_fee_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 12: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify Relayer authority
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Read PM Fee Config to calculate net_amount
+    // PM Fee Config offsets (matching Fund Program state.rs):
+    // - offset 41: minting_fee_bps (u16)
+    const PM_FEE_MINTING_BPS_OFFSET: usize = 41;
+    let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
+    if pm_fee_config_data.len() < 50 {
+        msg!("❌ PM Fee Config not initialized");
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    let minting_fee_bps = u16::from_le_bytes([
+        pm_fee_config_data[PM_FEE_MINTING_BPS_OFFSET],
+        pm_fee_config_data[PM_FEE_MINTING_BPS_OFFSET + 1],
+    ]);
+    drop(pm_fee_config_data);
+    
+    // Calculate fee and net_amount
+    let fee_amount = ((args.amount as u128) * (minting_fee_bps as u128) / 10000) as u64;
+    let net_amount = args.amount.saturating_sub(fee_amount);
+    
+    msg!("Fee calculation: gross={}, fee_bps={}, fee={}, net={}", 
+         args.amount, minting_fee_bps, fee_amount, net_amount);
+    
+    // Step 1: CPI to Vault - PredictionMarketLockWithFee
+    // This locks the funds AND collects the minting fee
+    msg!("CPI: Vault.PredictionMarketLockWithFee gross_amount={}", args.amount);
+    cpi_lock_for_prediction_with_fee(
+        vault_program_info,
+        vault_config_info,
+        user_vault_info,
+        pm_user_account_info,
+        config_info,  // PM Config as caller program marker
+        vault_token_account_info,
+        pm_fee_vault_info,
+        pm_fee_config_info,
+        token_program_info,
+        relayer_info, // Payer for auto-init
+        system_program_info,
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Create or update Position PDA
+    let (position_pda, position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let is_new_position = position_info.data_is_empty();
+    
+    if is_new_position {
+        // Create new Position account
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            POSITION_SEED, 
+            &market_id_bytes, 
+            args.user_wallet.as_ref(), 
+            &[position_bump]
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+        
+        let position = Position {
+            discriminator: POSITION_DISCRIMINATOR,
+            market_id: args.market_id,
+            owner: args.user_wallet,
+            yes_amount: net_amount,  // Use net_amount after fee
+            no_amount: net_amount,   // Use net_amount after fee
+            yes_locked: 0,
+            no_locked: 0,
+            yes_avg_cost: PRICE_PRECISION / 2, // 0.5 for complete set
+            no_avg_cost: PRICE_PRECISION / 2,
+            realized_pnl: 0,
+            total_cost_e6: args.amount,  // Record gross amount as cost basis
+            settled: false,
+            settlement_amount: 0,
+            created_at: current_time,
+            updated_at: current_time,
+            bump: position_bump,
+            reserved: [0u8; 16],
+        };
+        position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+        
+        msg!("Created new Position PDA for user {} in market {}", 
+             args.user_wallet, args.market_id);
+    } else {
+        // Update existing Position
+        let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+        
+        if position.discriminator != POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        if position.owner != args.user_wallet || position.market_id != args.market_id {
+            return Err(PredictionMarketError::PositionNotFound.into());
+        }
+        
+        position.yes_amount = safe_add_u64(position.yes_amount, net_amount)?;
+        position.no_amount = safe_add_u64(position.no_amount, net_amount)?;
+        position.total_cost_e6 = safe_add_u64(position.total_cost_e6, args.amount)?;
+        position.updated_at = current_time;
+        
+        position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+        
+        msg!("Updated Position: +{} YES, +{} NO shares (net after fee)", net_amount, net_amount);
+    }
+    
+    // Step 3: Update market stats (use net_amount for shares)
+    market.total_minted = safe_add_u64(market.total_minted, net_amount)?;
+    market.updated_at = current_time;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ RelayerMintCompleteSetV2WithFee completed");
+    msg!("User: {}, Market: {}", args.user_wallet, args.market_id);
+    msg!("Gross: {}, Fee: {}, Net shares: {}", args.amount, fee_amount, net_amount);
+    
+    Ok(())
+}
+
+/// Process RelayerRedeemCompleteSetV2WithFee
+/// 
+/// Same as RelayerRedeemCompleteSetV2 but uses Vault.PredictionMarketUnlockWithFee
+/// to collect redemption fee during the unlock operation.
+/// 
+/// Accounts:
+/// 0. `[signer]` Relayer
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` Position PDA
+/// 4. `[writable]` User Vault Account
+/// 5. `[writable]` PM User Account
+/// 6. `[]` Vault Config
+/// 7. `[]` Vault Program
+/// 8. `[writable]` Vault Token Account
+/// 9. `[writable]` PM Fee Vault
+/// 10. `[writable]` PM Fee Config PDA
+/// 11. `[]` Token Program
+fn process_relayer_redeem_complete_set_v2_with_fee(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRedeemCompleteSetArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: Position PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: User Vault Account (writable)
+    let user_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PM User Account (writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Config
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Vault Token Account
+    let vault_token_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: PM Fee Vault
+    let pm_fee_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 10: PM Fee Config PDA
+    let pm_fee_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 11: Token Program
+    let token_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify Relayer authority
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // For redemption, we only need the market to exist and not be resolved
+    // Users should be able to redeem even from paused markets
+    if market.status == MarketStatus::Resolved {
+        return Err(PredictionMarketError::MarketAlreadyResolved.into());
+    }
+    
+    // Validate amount
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Validate and update Position
+    let (position_pda, _position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let mut position = deserialize_account::<Position>(&position_info.data.borrow())?;
+    
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if position.owner != args.user_wallet || position.market_id != args.market_id {
+        return Err(PredictionMarketError::PositionNotFound.into());
+    }
+    
+    // Check user has enough shares to redeem
+    let available_yes = position.yes_amount.saturating_sub(position.yes_locked);
+    let available_no = position.no_amount.saturating_sub(position.no_locked);
+    
+    if available_yes < args.amount || available_no < args.amount {
+        msg!("Insufficient shares: need {}, have YES={}, NO={}", 
+             args.amount, available_yes, available_no);
+        return Err(PredictionMarketError::InsufficientPosition.into());
+    }
+    
+    // Burn virtual shares
+    position.yes_amount = position.yes_amount.saturating_sub(args.amount);
+    position.no_amount = position.no_amount.saturating_sub(args.amount);
+    position.updated_at = current_time;
+    position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
+    
+    // Step 2: CPI to Vault - PredictionMarketUnlockWithFee
+    // This releases funds AND collects redemption fee
+    msg!("CPI: Vault.PredictionMarketUnlockWithFee gross_amount={}", args.amount);
+    cpi_release_from_prediction_with_fee(
+        vault_program_info,
+        vault_config_info,
+        user_vault_info,
+        pm_user_account_info,
+        config_info,
+        vault_token_account_info,
+        pm_fee_vault_info,
+        pm_fee_config_info,
+        token_program_info,
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 3: Update market stats
+    market.total_minted = market.total_minted.saturating_sub(args.amount);
+    market.updated_at = current_time;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ RelayerRedeemCompleteSetV2WithFee completed");
+    msg!("User: {}, Market: {}", args.user_wallet, args.market_id);
+    msg!("Gross amount: {} (fee collected by Vault)", args.amount);
     
     Ok(())
 }

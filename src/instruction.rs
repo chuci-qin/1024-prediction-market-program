@@ -728,6 +728,48 @@ pub enum PredictionMarketInstruction {
     /// 8. `[]` Vault Program
     /// 9. `[]` System Program
     RelayerCancelOrderV2(RelayerCancelOrderV2Args),
+    
+    // =========================================================================
+    // V2 With Fee Instructions (Index 80+)
+    // Fee collection integrated into Vault CPI
+    // =========================================================================
+    
+    /// V2 WithFee: RelayerMintCompleteSet with minting fee collection
+    /// Uses Vault.PredictionMarketLockWithFee to lock funds and collect fee
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Position PDA
+    /// 4. `[writable]` User Vault Account
+    /// 5. `[writable]` PM User Account
+    /// 6. `[]` Vault Config
+    /// 7. `[]` Vault Program
+    /// 8. `[]` System Program
+    /// 9. `[writable]` Vault Token Account (for fee transfer)
+    /// 10. `[writable]` PM Fee Vault
+    /// 11. `[writable]` PM Fee Config PDA
+    /// 12. `[]` Token Program
+    RelayerMintCompleteSetV2WithFee(RelayerMintCompleteSetArgs),
+    
+    /// V2 WithFee: RelayerRedeemCompleteSet with redemption fee collection
+    /// Uses Vault.PredictionMarketUnlockWithFee to release funds and collect fee
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Position PDA
+    /// 4. `[writable]` User Vault Account
+    /// 5. `[writable]` PM User Account
+    /// 6. `[]` Vault Config
+    /// 7. `[]` Vault Program
+    /// 8. `[writable]` Vault Token Account (for fee transfer)
+    /// 9. `[writable]` PM Fee Vault
+    /// 10. `[writable]` PM Fee Config PDA
+    /// 11. `[]` Token Program
+    RelayerRedeemCompleteSetV2WithFee(RelayerRedeemCompleteSetArgs),
 }
 
 // ============================================================================

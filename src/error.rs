@@ -320,6 +320,28 @@ pub enum PredictionMarketError {
     
     #[error("Fund program mismatch")]
     FundProgramMismatch = 703,
+    
+    // === Fee Errors (800-899) ===
+    // Reserved for future V2 fee implementation in Vault Program layer
+    // These error codes are currently unused but reserved for the correct architecture
+    
+    #[error("PM Fee Config not initialized")]
+    PMFeeConfigNotInitialized = 800,
+    
+    #[error("PM Fee is paused")]
+    PMFeePaused = 801,
+    
+    #[error("Insufficient funds for fee")]
+    InsufficientFundsForFee = 802,
+    
+    #[error("Fee collection failed")]
+    FeeCollectionFailed = 803,
+    
+    #[error("Invalid PM Fee Config PDA")]
+    InvalidPMFeeConfig = 804,
+    
+    #[error("Invalid PM Fee Vault PDA")]
+    InvalidPMFeeVault = 805,
 }
 
 impl From<PredictionMarketError> for ProgramError {
