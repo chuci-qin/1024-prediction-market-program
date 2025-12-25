@@ -770,6 +770,94 @@ pub enum PredictionMarketInstruction {
     /// 10. `[writable]` PM Fee Config PDA
     /// 11. `[]` Token Program
     RelayerRedeemCompleteSetV2WithFee(RelayerRedeemCompleteSetArgs),
+    
+    // =========================================================================
+    // LLM Oracle Instructions (Phase 4.5 - Index 300+)
+    // =========================================================================
+    
+    /// Initialize market oracle data account
+    /// Task 4.5.1: Creates MarketOracleData PDA for storing IPFS data
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market
+    /// 3. `[writable]` MarketOracleData PDA (new)
+    /// 4. `[]` System Program
+    InitializeMarketOracleData(InitializeMarketOracleDataArgs),
+    
+    /// Set creation data on market oracle data account
+    /// Task 4.5.1-4.5.2: Store market creation metadata CID and hash
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin (market admin)
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market
+    /// 3. `[writable]` MarketOracleData
+    SetCreationData(SetCreationDataArgs),
+    
+    /// Freeze oracle config on market oracle data account
+    /// Task 4.5.3-4.5.4: Lock config before trading can begin
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market (status -> Active if ready)
+    /// 3. `[writable]` MarketOracleData
+    FreezeOracleConfig(FreezeOracleConfigArgs),
+    
+    /// Halt trading on a market (end time reached)
+    /// Task 4.5.5: Transition to TradingHalted status
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Anyone (permissionless, time-based check)
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    HaltTrading(HaltTradingArgs),
+    
+    /// Propose result with research data (LLM Oracle flow)
+    /// Task 4.5.6-4.5.9: Extended ProposeResult with IPFS data
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Oracle Admin
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` OracleProposal PDA
+    /// 4. `[writable]` OracleProposalData PDA (new - stores IPFS data)
+    /// 5. `[]` MarketOracleData (for config hash verification)
+    /// 6. `[writable]` Proposer's Vault Account (for bond)
+    /// 7. `[]` Vault Config
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    ProposeResultWithResearch(ProposeResultWithResearchArgs),
+    
+    /// Propose result manually (admin override for UNDETERMINED cases)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Oracle Admin
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` OracleProposal PDA
+    /// 4. `[writable]` OracleProposalData PDA
+    /// 5. `[]` MarketOracleData
+    /// 6. `[writable]` Proposer's Vault Account (for bond)
+    /// 7. `[]` Vault Config
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    ProposeResultManual(ProposeResultManualArgs),
+    
+    /// Challenge result with research data
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Challenger
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` OracleProposal
+    /// 4. `[writable]` OracleProposalData
+    /// 5. `[writable]` Challenger's Vault Account (for bond)
+    /// 6. `[]` Vault Config
+    /// 7. `[]` Vault Program
+    ChallengeResultWithEvidence(ChallengeResultWithEvidenceArgs),
 }
 
 // ============================================================================
@@ -1377,6 +1465,105 @@ pub struct RelayerMatchBurnMultiArgs {
     pub amount: u64,
     /// Order info for each outcome: Vec<(outcome_index, order_id, price_e6)>
     pub orders: Vec<MultiOutcomeOrderInfo>,
+}
+
+// ============================================================================
+// LLM Oracle Args (Phase 4.5)
+// ============================================================================
+
+/// Initialize market oracle data account
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct InitializeMarketOracleDataArgs {
+    /// Market ID
+    pub market_id: u64,
+}
+
+/// Set creation data on market
+/// Task 4.5.1-4.5.2
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct SetCreationDataArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// IPFS CID of creation data (64 bytes)
+    pub creation_data_cid: [u8; 64],
+    /// SHA256 hash of creation data (32 bytes)
+    pub creation_data_hash: [u8; 32],
+}
+
+/// Freeze oracle config
+/// Task 4.5.3-4.5.4
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct FreezeOracleConfigArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// IPFS CID of oracle config (64 bytes)
+    pub oracle_config_cid: [u8; 64],
+    /// SHA256 hash of oracle config (32 bytes)
+    pub oracle_config_hash: [u8; 32],
+}
+
+/// Halt trading on market
+/// Task 4.5.5
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct HaltTradingArgs {
+    /// Market ID
+    pub market_id: u64,
+}
+
+/// Propose result with research data (LLM Oracle)
+/// Task 4.5.6-4.5.9
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ProposeResultWithResearchArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Proposed result (for binary markets)
+    pub result: MarketResult,
+    /// Proposed outcome index (for multi-outcome markets, 0-based)
+    pub outcome_index: u8,
+    /// IPFS CID of research data (64 bytes)
+    pub research_data_cid: [u8; 64],
+    /// SHA256 hash of research data (32 bytes)
+    pub research_data_hash: [u8; 32],
+    /// Oracle config hash (must match frozen config for verification)
+    pub oracle_config_hash: [u8; 32],
+    /// Confidence score (0-100)
+    pub confidence_score: u8,
+    /// Whether manual review was required (UNDETERMINED case)
+    pub requires_manual_review: bool,
+}
+
+/// Propose result manually (admin override)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ProposeResultManualArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Proposed result (for binary markets)
+    pub result: MarketResult,
+    /// Proposed outcome index (for multi-outcome markets, 0-based)
+    pub outcome_index: u8,
+    /// IPFS CID of research data from LLM Oracle (64 bytes)
+    pub research_data_cid: [u8; 64],
+    /// SHA256 hash of research data (32 bytes)
+    pub research_data_hash: [u8; 32],
+    /// IPFS CID of manual proposal reasoning (64 bytes)
+    pub manual_proposal_cid: [u8; 64],
+    /// SHA256 hash of manual proposal (32 bytes)
+    pub manual_reasoning_hash: [u8; 32],
+    /// Oracle config hash (must match frozen config for verification)
+    pub oracle_config_hash: [u8; 32],
+}
+
+/// Challenge result with evidence
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ChallengeResultWithEvidenceArgs {
+    /// Market ID
+    pub market_id: u64,
+    /// Challenger's proposed result (for binary markets)
+    pub challenger_result: MarketResult,
+    /// Challenger's proposed outcome index (for multi-outcome markets)
+    pub challenger_outcome_index: u8,
+    /// Reasoning (optional, stored off-chain reference)
+    pub evidence_hash: [u8; 32],
 }
 
 // ============================================================================

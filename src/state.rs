@@ -85,6 +85,9 @@ impl Default for MarketType {
 }
 
 /// Market lifecycle status
+/// 
+/// Extended in Phase 4 (LLM Oracle) to support the full resolution flow.
+/// Status values are assigned explicitly to ensure ABI stability.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketStatus {
     /// Pending review/activation
@@ -97,11 +100,53 @@ pub enum MarketStatus {
     Resolved = 3,
     /// Cancelled (refunds available)
     Cancelled = 4,
+    /// Trading halted (market end time reached, awaiting oracle resolution)
+    /// Task 4.2.2: Added for LLM Oracle flow
+    TradingHalted = 5,
+    /// Awaiting result from LLM Oracle
+    /// Task 4.2.3: Added for LLM Oracle flow
+    AwaitingResult = 6,
+    /// Result has been proposed, in challenge window
+    /// Task 4.2.4: Added for LLM Oracle flow
+    ResultProposed = 7,
+    /// Result was challenged, awaiting dispute resolution
+    /// Task 4.2.5: Added for LLM Oracle flow
+    Challenged = 8,
+    /// Dispute is being processed by committee/governance
+    /// Task 4.2.6: Added for LLM Oracle flow
+    Disputed = 9,
 }
 
 impl Default for MarketStatus {
     fn default() -> Self {
         MarketStatus::Pending
+    }
+}
+
+impl MarketStatus {
+    /// Check if trading is allowed in this status
+    pub fn is_tradeable(&self) -> bool {
+        matches!(self, MarketStatus::Active)
+    }
+    
+    /// Check if market can transition to TradingHalted
+    pub fn can_halt_trading(&self) -> bool {
+        matches!(self, MarketStatus::Active)
+    }
+    
+    /// Check if market can receive a result proposal
+    pub fn can_propose_result(&self) -> bool {
+        matches!(self, MarketStatus::TradingHalted | MarketStatus::AwaitingResult)
+    }
+    
+    /// Check if market is in a challengeable state
+    pub fn can_challenge(&self) -> bool {
+        matches!(self, MarketStatus::ResultProposed)
+    }
+    
+    /// Check if market is in terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, MarketStatus::Resolved | MarketStatus::Cancelled)
     }
 }
 
@@ -205,6 +250,218 @@ pub enum ProposalStatus {
 impl Default for ProposalStatus {
     fn default() -> Self {
         ProposalStatus::Pending
+    }
+}
+
+// ============================================================================
+// LLM Oracle Types (Phase 4)
+// ============================================================================
+
+/// Type alias for IPFS CID (64 bytes to accommodate CIDv1)
+/// Task 4.1.1: Define IpfsCid type
+pub type IpfsCid = [u8; 64];
+
+/// Type alias for SHA256 hash (32 bytes)
+/// Task 4.1.2: Define Sha256Hash type
+pub type Sha256Hash = [u8; 32];
+
+/// Proposal type (how the result was determined)
+/// Task 4.4.1: Added for LLM Oracle flow
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalType {
+    /// Determined by LLM Oracle (automated)
+    LlmOracle = 0,
+    /// Manually proposed by admin (requires_manual_review was true)
+    Manual = 1,
+    /// Escalated to governance/committee after dispute
+    Escalated = 2,
+}
+
+impl Default for ProposalType {
+    fn default() -> Self {
+        ProposalType::LlmOracle
+    }
+}
+
+// ============================================================================
+// IPFS CID Helper Functions (Phase 4.1.4)
+// ============================================================================
+
+/// Convert CID string to bytes array
+pub fn cid_to_bytes(cid: &str) -> IpfsCid {
+    let mut bytes = [0u8; 64];
+    let cid_bytes = cid.as_bytes();
+    let len = std::cmp::min(cid_bytes.len(), 64);
+    bytes[..len].copy_from_slice(&cid_bytes[..len]);
+    bytes
+}
+
+/// Convert bytes array to CID string (trimming null bytes)
+pub fn bytes_to_cid(bytes: &IpfsCid) -> String {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(64);
+    String::from_utf8_lossy(&bytes[..len]).to_string()
+}
+
+/// Check if CID bytes are empty (all zeros)
+pub fn is_cid_empty(cid: &IpfsCid) -> bool {
+    cid.iter().all(|&b| b == 0)
+}
+
+/// Convert hex hash string to bytes array
+pub fn hex_to_hash(hex: &str) -> Result<Sha256Hash, ()> {
+    if hex.len() != 64 {
+        return Err(());
+    }
+    
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let start = i * 2;
+        *byte = u8::from_str_radix(&hex[start..start + 2], 16).map_err(|_| ())?;
+    }
+    Ok(bytes)
+}
+
+/// Convert hash bytes to hex string
+pub fn hash_to_hex(bytes: &Sha256Hash) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Check if hash bytes are empty (all zeros)
+pub fn is_hash_empty(hash: &Sha256Hash) -> bool {
+    hash.iter().all(|&b| b == 0)
+}
+
+// ============================================================================
+// Market Oracle Data (Phase 4.3 - Separate account for IPFS data)
+// ============================================================================
+
+/// PDA seed for market oracle data
+pub const MARKET_ORACLE_DATA_SEED: &[u8] = b"market_oracle_data";
+
+/// Discriminator for market oracle data accounts
+pub const MARKET_ORACLE_DATA_DISCRIMINATOR: u64 = 0x4D4F5241434C4544; // "MORACLED"
+
+/// Market Oracle Data - stores IPFS CIDs and hashes for LLM Oracle
+/// 
+/// This is a separate account to avoid modifying the existing Market structure size.
+/// PDA Seeds: ["market_oracle_data", market_id.to_le_bytes()]
+/// 
+/// Task 4.3.1-4.3.7: Market structure extension via separate account
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MarketOracleData {
+    /// Account discriminator
+    pub discriminator: u64,
+    
+    /// Market ID (foreign key to Market)
+    pub market_id: u64,
+    
+    /// Creation data CID (market metadata stored on IPFS)
+    /// Task 4.3.1: creation_data_cid
+    pub creation_data_cid: IpfsCid,
+    
+    /// SHA256 hash of creation data
+    /// Task 4.3.2: creation_data_hash
+    pub creation_data_hash: Sha256Hash,
+    
+    /// Oracle config CID (frozen configuration on IPFS)
+    /// Task 4.3.3: oracle_config_cid
+    pub oracle_config_cid: IpfsCid,
+    
+    /// SHA256 hash of oracle config
+    /// Task 4.3.4: oracle_config_hash
+    pub oracle_config_hash: Sha256Hash,
+    
+    /// When the config was frozen (0 if not frozen)
+    /// Task 4.3.5: config_frozen_at
+    pub config_frozen_at: i64,
+    
+    /// Is config frozen (trading enabled after this)
+    pub is_config_frozen: bool,
+    
+    /// Is creation data set
+    pub is_creation_data_set: bool,
+    
+    /// Creation timestamp
+    pub created_at: i64,
+    
+    /// Last update timestamp
+    pub updated_at: i64,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// Reserved for future use
+    pub reserved: [u8; 32],
+}
+
+impl MarketOracleData {
+    /// Task 4.3.6: Calculate SIZE constant
+    pub const SIZE: usize = 8   // discriminator
+        + 8   // market_id
+        + 64  // creation_data_cid
+        + 32  // creation_data_hash
+        + 64  // oracle_config_cid
+        + 32  // oracle_config_hash
+        + 8   // config_frozen_at
+        + 1   // is_config_frozen
+        + 1   // is_creation_data_set
+        + 8   // created_at
+        + 8   // updated_at
+        + 1   // bump
+        + 32; // reserved = 267 bytes
+    
+    /// PDA seeds
+    pub fn seeds(market_id: u64) -> Vec<Vec<u8>> {
+        vec![
+            MARKET_ORACLE_DATA_SEED.to_vec(),
+            market_id.to_le_bytes().to_vec(),
+        ]
+    }
+    
+    /// Create new empty market oracle data
+    pub fn new(market_id: u64, bump: u8, current_time: i64) -> Self {
+        Self {
+            discriminator: MARKET_ORACLE_DATA_DISCRIMINATOR,
+            market_id,
+            creation_data_cid: [0u8; 64],
+            creation_data_hash: [0u8; 32],
+            oracle_config_cid: [0u8; 64],
+            oracle_config_hash: [0u8; 32],
+            config_frozen_at: 0,
+            is_config_frozen: false,
+            is_creation_data_set: false,
+            created_at: current_time,
+            updated_at: current_time,
+            bump,
+            reserved: [0u8; 32],
+        }
+    }
+    
+    /// Set creation data
+    pub fn set_creation_data(&mut self, cid: IpfsCid, hash: Sha256Hash, current_time: i64) {
+        self.creation_data_cid = cid;
+        self.creation_data_hash = hash;
+        self.is_creation_data_set = true;
+        self.updated_at = current_time;
+    }
+    
+    /// Freeze oracle config
+    pub fn freeze_config(&mut self, cid: IpfsCid, hash: Sha256Hash, current_time: i64) {
+        self.oracle_config_cid = cid;
+        self.oracle_config_hash = hash;
+        self.config_frozen_at = current_time;
+        self.is_config_frozen = true;
+        self.updated_at = current_time;
+    }
+    
+    /// Check if ready for trading (creation data set and config frozen)
+    pub fn is_ready_for_trading(&self) -> bool {
+        self.is_creation_data_set && self.is_config_frozen
+    }
+    
+    /// Verify oracle config hash matches
+    pub fn verify_config_hash(&self, expected_hash: &Sha256Hash) -> bool {
+        self.oracle_config_hash == *expected_hash
     }
 }
 
@@ -1299,6 +1556,181 @@ impl OracleProposal {
     /// Check if proposal can be challenged
     pub fn can_challenge(&self, current_time: i64) -> bool {
         self.status == ProposalStatus::Pending && current_time < self.challenge_deadline
+    }
+}
+
+// ============================================================================
+// Extended Oracle Proposal Data (Phase 4.4 - Separate account for IPFS data)
+// ============================================================================
+
+/// PDA seed for oracle proposal data
+pub const ORACLE_PROPOSAL_DATA_SEED: &[u8] = b"oracle_proposal_data";
+
+/// Discriminator for oracle proposal data accounts
+pub const ORACLE_PROPOSAL_DATA_DISCRIMINATOR: u64 = 0x4F5250524F50445F; // "ORPROPD_"
+
+/// Extended Oracle Proposal Data - stores research data and manual proposal info
+/// 
+/// This is a separate account to store IPFS data without modifying OracleProposal size.
+/// PDA Seeds: ["oracle_proposal_data", market_id.to_le_bytes()]
+/// 
+/// Task 4.4.1-4.4.6: OracleProposal extension via separate account
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct OracleProposalData {
+    /// Account discriminator
+    pub discriminator: u64,
+    
+    /// Market ID (foreign key to OracleProposal)
+    pub market_id: u64,
+    
+    /// Proposal type (LlmOracle, Manual, Escalated)
+    /// Task 4.4.1: proposal_type
+    pub proposal_type: ProposalType,
+    
+    /// Research data CID (LLM Oracle research stored on IPFS)
+    /// Task 4.4.2: research_data_cid
+    pub research_data_cid: IpfsCid,
+    
+    /// SHA256 hash of research data
+    /// Task 4.4.3: research_data_hash
+    pub research_data_hash: Sha256Hash,
+    
+    /// Manual proposal CID (for manual proposals)
+    /// Task 4.4.4: manual_proposal_cid
+    /// Empty if proposal_type is LlmOracle
+    pub manual_proposal_cid: IpfsCid,
+    
+    /// SHA256 hash of manual proposal reasoning
+    /// Task 4.4.5: manual_reasoning_hash
+    pub manual_reasoning_hash: Sha256Hash,
+    
+    /// Winning outcome index (for multi-outcome markets)
+    /// For binary markets: 0 = YES, 1 = NO
+    pub proposed_outcome_index: u8,
+    
+    /// Challenger's proposed outcome index (if disputed)
+    pub challenger_outcome_index: Option<u8>,
+    
+    /// LLM consensus confidence score (0-100)
+    pub confidence_score: u8,
+    
+    /// Whether manual review was required
+    pub requires_manual_review: bool,
+    
+    /// Creation timestamp
+    pub created_at: i64,
+    
+    /// Last update timestamp
+    pub updated_at: i64,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// Reserved for future use
+    pub reserved: [u8; 32],
+}
+
+impl OracleProposalData {
+    /// Task 4.4.6: Calculate SIZE constant
+    pub const SIZE: usize = 8   // discriminator
+        + 8   // market_id
+        + 1   // proposal_type
+        + 64  // research_data_cid
+        + 32  // research_data_hash
+        + 64  // manual_proposal_cid
+        + 32  // manual_reasoning_hash
+        + 1   // proposed_outcome_index
+        + 2   // challenger_outcome_index (Option<u8>)
+        + 1   // confidence_score
+        + 1   // requires_manual_review
+        + 8   // created_at
+        + 8   // updated_at
+        + 1   // bump
+        + 32; // reserved = 263 bytes
+    
+    /// PDA seeds
+    pub fn seeds(market_id: u64) -> Vec<Vec<u8>> {
+        vec![
+            ORACLE_PROPOSAL_DATA_SEED.to_vec(),
+            market_id.to_le_bytes().to_vec(),
+        ]
+    }
+    
+    /// Create new LLM oracle proposal data
+    pub fn new_llm(
+        market_id: u64,
+        research_cid: IpfsCid,
+        research_hash: Sha256Hash,
+        outcome_index: u8,
+        confidence: u8,
+        requires_manual_review: bool,
+        bump: u8,
+        current_time: i64,
+    ) -> Self {
+        Self {
+            discriminator: ORACLE_PROPOSAL_DATA_DISCRIMINATOR,
+            market_id,
+            proposal_type: ProposalType::LlmOracle,
+            research_data_cid: research_cid,
+            research_data_hash: research_hash,
+            manual_proposal_cid: [0u8; 64],
+            manual_reasoning_hash: [0u8; 32],
+            proposed_outcome_index: outcome_index,
+            challenger_outcome_index: None,
+            confidence_score: confidence,
+            requires_manual_review,
+            created_at: current_time,
+            updated_at: current_time,
+            bump,
+            reserved: [0u8; 32],
+        }
+    }
+    
+    /// Create new manual proposal data
+    pub fn new_manual(
+        market_id: u64,
+        research_cid: IpfsCid,
+        research_hash: Sha256Hash,
+        manual_cid: IpfsCid,
+        manual_hash: Sha256Hash,
+        outcome_index: u8,
+        bump: u8,
+        current_time: i64,
+    ) -> Self {
+        Self {
+            discriminator: ORACLE_PROPOSAL_DATA_DISCRIMINATOR,
+            market_id,
+            proposal_type: ProposalType::Manual,
+            research_data_cid: research_cid,
+            research_data_hash: research_hash,
+            manual_proposal_cid: manual_cid,
+            manual_reasoning_hash: manual_hash,
+            proposed_outcome_index: outcome_index,
+            challenger_outcome_index: None,
+            confidence_score: 100, // Manual proposals are fully confident
+            requires_manual_review: false,
+            created_at: current_time,
+            updated_at: current_time,
+            bump,
+            reserved: [0u8; 32],
+        }
+    }
+    
+    /// Set challenger outcome for disputes
+    pub fn set_challenger(&mut self, challenger_outcome: u8, current_time: i64) {
+        self.challenger_outcome_index = Some(challenger_outcome);
+        self.updated_at = current_time;
+    }
+    
+    /// Escalate to governance/committee
+    pub fn escalate(&mut self, current_time: i64) {
+        self.proposal_type = ProposalType::Escalated;
+        self.updated_at = current_time;
+    }
+    
+    /// Verify research data hash matches
+    pub fn verify_research_hash(&self, expected_hash: &Sha256Hash) -> bool {
+        self.research_data_hash == *expected_hash
     }
 }
 

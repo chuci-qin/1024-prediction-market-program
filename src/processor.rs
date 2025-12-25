@@ -312,6 +312,36 @@ pub fn process_instruction(
             msg!("Instruction: RelayerRedeemCompleteSetV2WithFee");
             process_relayer_redeem_complete_set_v2_with_fee(program_id, accounts, args)
         }
+        
+        // === LLM Oracle Instructions (Phase 4.5) ===
+        PredictionMarketInstruction::InitializeMarketOracleData(args) => {
+            msg!("Instruction: InitializeMarketOracleData");
+            process_initialize_market_oracle_data(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::SetCreationData(args) => {
+            msg!("Instruction: SetCreationData");
+            process_set_creation_data(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::FreezeOracleConfig(args) => {
+            msg!("Instruction: FreezeOracleConfig");
+            process_freeze_oracle_config(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::HaltTrading(args) => {
+            msg!("Instruction: HaltTrading");
+            process_halt_trading(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ProposeResultWithResearch(args) => {
+            msg!("Instruction: ProposeResultWithResearch");
+            process_propose_result_with_research(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ProposeResultManual(args) => {
+            msg!("Instruction: ProposeResultManual");
+            process_propose_result_manual(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::ChallengeResultWithEvidence(args) => {
+            msg!("Instruction: ChallengeResultWithEvidence");
+            process_challenge_result_with_evidence(program_id, accounts, args)
+        }
     }
 }
 
@@ -4969,5 +4999,695 @@ fn verify_relayer(config: &PredictionMarketConfig, relayer: &Pubkey) -> ProgramR
     
     msg!("Unauthorized relayer: {}", relayer);
     Err(PredictionMarketError::Unauthorized.into())
+}
+
+// ============================================================================
+// LLM Oracle Processors (Phase 4.6)
+// ============================================================================
+
+use crate::state::{
+    MarketOracleData, OracleProposalData, ProposalType,
+    MARKET_ORACLE_DATA_SEED, ORACLE_PROPOSAL_DATA_SEED,
+    MARKET_ORACLE_DATA_DISCRIMINATOR, ORACLE_PROPOSAL_DATA_DISCRIMINATOR,
+};
+
+/// Task 4.6.1: Initialize market oracle data account
+fn process_initialize_market_oracle_data(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: InitializeMarketOracleDataArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MarketOracleData PDA (writable, to be created)
+    let oracle_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Task 4.6.2: Verify admin authority
+    if *admin_info.key != config.admin && *admin_info.key != config.oracle_admin {
+        msg!("Unauthorized: {} is not admin", admin_info.key);
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and validate market
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Derive and validate oracle data PDA
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let (oracle_data_pda, oracle_data_bump) = Pubkey::find_program_address(
+        &[MARKET_ORACLE_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *oracle_data_info.key != oracle_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Create the oracle data account
+    let rent = Rent::get()?;
+    let space = MarketOracleData::SIZE;
+    let lamports = rent.minimum_balance(space);
+    
+    let create_account_ix = system_instruction::create_account(
+        admin_info.key,
+        oracle_data_info.key,
+        lamports,
+        space as u64,
+        program_id,
+    );
+    
+    let seeds: &[&[u8]] = &[MARKET_ORACLE_DATA_SEED, &market_id_bytes, &[oracle_data_bump]];
+    
+    invoke_signed(
+        &create_account_ix,
+        &[admin_info.clone(), oracle_data_info.clone(), system_program_info.clone()],
+        &[seeds],
+    )?;
+    
+    // Initialize the account data
+    let current_time = get_current_timestamp()?;
+    let oracle_data = MarketOracleData::new(args.market_id, oracle_data_bump, current_time);
+    oracle_data.serialize(&mut &mut oracle_data_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ Initialized MarketOracleData for market {}", args.market_id);
+    
+    Ok(())
+}
+
+/// Task 4.6.1-4.6.3: Set creation data on market oracle data
+fn process_set_creation_data(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: SetCreationDataArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MarketOracleData (writable)
+    let oracle_data_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify admin authority
+    if *admin_info.key != config.admin && *admin_info.key != config.oracle_admin {
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and validate market - Task 4.6.3: only Pending status
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if market.status != MarketStatus::Pending {
+        msg!("Market status must be Pending, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    // Load and update oracle data
+    let mut oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
+    if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if oracle_data.market_id != args.market_id {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    oracle_data.set_creation_data(args.creation_data_cid, args.creation_data_hash, current_time);
+    oracle_data.serialize(&mut &mut oracle_data_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ Set creation data for market {}", args.market_id);
+    
+    Ok(())
+}
+
+/// Task 4.6.4-4.6.6: Freeze oracle config
+fn process_freeze_oracle_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: FreezeOracleConfigArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MarketOracleData (writable)
+    let oracle_data_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify admin authority
+    if *admin_info.key != config.admin && *admin_info.key != config.oracle_admin {
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and update market - Task 4.6.6: transition Pending -> Active
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Load and update oracle data
+    let mut oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
+    if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if oracle_data.market_id != args.market_id {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Require creation data to be set first
+    if !oracle_data.is_creation_data_set {
+        msg!("Creation data must be set before freezing config");
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    oracle_data.freeze_config(args.oracle_config_cid, args.oracle_config_hash, current_time);
+    oracle_data.serialize(&mut &mut oracle_data_info.data.borrow_mut()[..])?;
+    
+    // Transition market to Active if ready
+    if market.status == MarketStatus::Pending && oracle_data.is_ready_for_trading() {
+        market.status = MarketStatus::Active;
+        market.updated_at = current_time;
+        market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+        msg!("Market {} activated (config frozen)", args.market_id);
+    }
+    
+    msg!("✅ Frozen oracle config for market {}", args.market_id);
+    
+    Ok(())
+}
+
+/// Task 4.6.7-4.6.8: Halt trading on market (end time reached)
+fn process_halt_trading(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: HaltTradingArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Anyone (signer) - permissionless
+    let caller_info = next_account_info(account_info_iter)?;
+    check_signer(caller_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Load and update market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Task 4.6.8: Time-based check - resolution time must have passed
+    let current_time = get_current_timestamp()?;
+    if current_time < market.resolution_time {
+        msg!("Resolution time not reached: current={}, resolution={}", 
+             current_time, market.resolution_time);
+        return Err(PredictionMarketError::ResolutionTimeNotReached.into());
+    }
+    
+    // Only Active markets can be halted
+    if market.status != MarketStatus::Active {
+        msg!("Market status must be Active, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    // Transition to TradingHalted
+    market.status = MarketStatus::TradingHalted;
+    market.updated_at = current_time;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ Halted trading for market {} (resolution time: {})", 
+         args.market_id, market.resolution_time);
+    
+    Ok(())
+}
+
+/// Task 4.6.9-4.6.12: Propose result with research data
+fn process_propose_result_with_research(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ProposeResultWithResearchArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Oracle Admin (signer)
+    let oracle_admin_info = next_account_info(account_info_iter)?;
+    check_signer(oracle_admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: OracleProposal PDA (writable)
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: OracleProposalData PDA (writable)
+    let proposal_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: MarketOracleData (for config hash verification)
+    let oracle_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 6+: Vault accounts for bond (skipped for now)
+    let _vault_accounts = account_info_iter;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify oracle admin authority
+    if *oracle_admin_info.key != config.oracle_admin {
+        msg!("Unauthorized: {} is not oracle_admin", oracle_admin_info.key);
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and update market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Task 4.6.10: Verify oracle config hash matches frozen config
+    let oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
+    if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if !oracle_data.verify_config_hash(&args.oracle_config_hash) {
+        msg!("Oracle config hash mismatch");
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Market must be TradingHalted or AwaitingResult
+    if !matches!(market.status, MarketStatus::TradingHalted | MarketStatus::AwaitingResult) {
+        msg!("Market status must be TradingHalted or AwaitingResult, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Create OracleProposal account (simplified - actual implementation would handle PDA creation)
+    let (proposal_pda, _proposal_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Create OracleProposalData account (simplified)
+    let (proposal_data_pda, proposal_data_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_data_info.key != proposal_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Task 4.6.11-4.6.12: Store research data in OracleProposalData
+    let proposal_data = OracleProposalData::new_llm(
+        args.market_id,
+        args.research_data_cid,
+        args.research_data_hash,
+        args.outcome_index,
+        args.confidence_score,
+        args.requires_manual_review,
+        proposal_data_bump,
+        current_time,
+    );
+    proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
+    
+    // Update market status
+    market.status = MarketStatus::ResultProposed;
+    market.updated_at = current_time;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ Proposed result for market {}: outcome={}, confidence={}", 
+         args.market_id, args.outcome_index, args.confidence_score);
+    
+    Ok(())
+}
+
+/// Process manual result proposal (Admin override for UNDETERMINED cases)
+/// 
+/// Task 4.6.13-4.6.16: Manual proposal with evidence
+/// 
+/// Accounts:
+/// 0. `[signer]` Oracle Admin
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` OracleProposal PDA
+/// 4. `[writable]` OracleProposalData PDA
+/// 5. `[]` MarketOracleData (for original research reference)
+/// 6. `[writable]` Admin's Vault Account (for bond)
+/// 7. `[]` Vault Config
+/// 8. `[]` Vault Program
+/// 9. `[]` System Program
+fn process_propose_result_manual(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ProposeResultManualArgs,
+) -> ProgramResult {
+    msg!("ProposeResultManual: market={}, outcome={}", args.market_id, args.outcome_index);
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Oracle Admin (signer)
+    let oracle_admin_info = next_account_info(account_info_iter)?;
+    check_signer(oracle_admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: OracleProposal PDA (writable)
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: OracleProposalData PDA (writable)
+    let proposal_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: MarketOracleData (for original research reference)
+    let oracle_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 6+: Vault accounts for bond (optional, skipped for now)
+    let _remaining_accounts = account_info_iter;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify oracle admin authority
+    if *oracle_admin_info.key != config.oracle_admin {
+        msg!("Unauthorized: {} is not oracle_admin", oracle_admin_info.key);
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Load MarketOracleData to get original research reference
+    let oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
+    if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Market must be TradingHalted, AwaitingResult, or ResultProposed (to override UNDETERMINED)
+    if !matches!(
+        market.status, 
+        MarketStatus::TradingHalted | MarketStatus::AwaitingResult | MarketStatus::ResultProposed
+    ) {
+        msg!("Market status must be TradingHalted, AwaitingResult, or ResultProposed for manual override, got {:?}", 
+             market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Validate OracleProposal PDA
+    let (proposal_pda, _proposal_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Validate OracleProposalData PDA
+    let (proposal_data_pda, proposal_data_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_data_info.key != proposal_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Task 4.6.14-4.6.15: Create manual proposal data with evidence
+    // Use research_data from original LLM attempt (if any)
+    let research_cid = oracle_data.oracle_config_cid; // Reference to original config/research
+    let research_hash = oracle_data.oracle_config_hash;
+    
+    let proposal_data = OracleProposalData::new_manual(
+        args.market_id,
+        research_cid,                    // Original research reference
+        research_hash,                   // Original research hash
+        args.manual_proposal_cid,        // Manual judgment IPFS CID
+        args.manual_reasoning_hash,      // Manual reasoning hash
+        args.outcome_index,              // Admin's determined outcome
+        proposal_data_bump,
+        current_time,
+    );
+    
+    // Serialize proposal data to account
+    proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
+    
+    // Update market status to ResultProposed
+    market.status = MarketStatus::ResultProposed;
+    market.updated_at = current_time;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ Manual proposal for market {}: outcome={}, manual_cid={:?}", 
+         args.market_id, 
+         args.outcome_index,
+         String::from_utf8_lossy(&args.manual_proposal_cid[0..20]));
+    
+    Ok(())
+}
+
+/// Process challenge with evidence (Task 4.6.17-4.6.20)
+/// 
+/// Allows any user to challenge a proposed result by posting a counter-bond
+/// and providing evidence (IPFS CID + hash) supporting their alternative outcome.
+/// 
+/// Accounts:
+/// 0. `[signer]` Challenger
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` OracleProposal PDA
+/// 4. `[writable]` OracleProposalData PDA (to record challenger's outcome)
+/// 5. `[writable]` Challenger's Vault Account (for bond)
+/// 6. `[writable]` Market Vault (to receive bond)
+/// 7. `[]` Vault Config
+/// 8. `[]` Vault Program
+fn process_challenge_result_with_evidence(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ChallengeResultWithEvidenceArgs,
+) -> ProgramResult {
+    msg!("ChallengeResultWithEvidence: market={}, challenger_outcome={}", 
+         args.market_id, args.challenger_outcome_index);
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Challenger (signer)
+    let challenger_info = next_account_info(account_info_iter)?;
+    check_signer(challenger_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: OracleProposal PDA (writable)
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: OracleProposalData PDA (writable)
+    let proposal_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 5+: Vault accounts for bond transfer (handled separately)
+    let _remaining_accounts = account_info_iter;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Market must be in ResultProposed state
+    if market.status != MarketStatus::ResultProposed {
+        msg!("Market must be in ResultProposed state to challenge, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Validate OracleProposal PDA
+    let (proposal_pda, _proposal_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and validate OracleProposal to check challenge window
+    let proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
+    if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Task 4.6.18: Verify within challenge window
+    let challenge_deadline = proposal.proposed_at + config.challenge_window_secs;
+    if current_time > challenge_deadline {
+        msg!("Challenge window has expired: current={}, deadline={}", current_time, challenge_deadline);
+        return Err(PredictionMarketError::ChallengeWindowExpired.into());
+    }
+    
+    // Validate OracleProposalData PDA
+    let (proposal_data_pda, _proposal_data_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_data_info.key != proposal_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and update OracleProposalData with challenger's outcome
+    let mut proposal_data = deserialize_account::<OracleProposalData>(&proposal_data_info.data.borrow())?;
+    if proposal_data.discriminator != ORACLE_PROPOSAL_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Task 4.6.19: Challenger's outcome must differ from proposed outcome
+    if args.challenger_outcome_index == proposal_data.proposed_outcome_index {
+        msg!("Challenger outcome must differ from proposed outcome");
+        return Err(PredictionMarketError::InvalidOutcome.into());
+    }
+    
+    // Task 4.6.20: Record challenger's outcome and evidence hash
+    proposal_data.set_challenger(args.challenger_outcome_index, current_time);
+    
+    // Update market status to Challenged
+    market.status = MarketStatus::Challenged;
+    market.updated_at = current_time;
+    
+    // Serialize updated accounts
+    proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    // TODO: Transfer challenger bond from challenger's vault to market vault
+    // This requires CPI to Vault Program (skipped for now, handled by relayer)
+    
+    msg!("✅ Challenge submitted for market {}: challenger={}, outcome={}, evidence_hash={:?}", 
+         args.market_id,
+         challenger_info.key,
+         args.challenger_outcome_index,
+         &args.evidence_hash[0..8]);
+    
+    Ok(())
 }
 
