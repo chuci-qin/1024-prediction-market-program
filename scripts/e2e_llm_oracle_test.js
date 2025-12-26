@@ -37,7 +37,8 @@ const CONFIG = {
   ORACLE_API_URL: process.env.LLM_ORACLE_API_URL || 'http://localhost:8989',
   
   // Backend API
-  BACKEND_API_URL: process.env.BACKEND_API_URL || 'http://localhost:8080',
+  // Gateway API 端口 8082 (前端专用)
+  BACKEND_API_URL: process.env.BACKEND_API_URL || 'http://localhost:8082',
   
   // Admin keypair
   ADMIN_KEYPAIR_PATH: process.env.ADMIN_KEYPAIR || './oracle-admin.json',
@@ -280,7 +281,7 @@ class LlmOracleE2ETest {
       log('  📡 Calling Oracle API (this may take 2-5 minutes)...');
       
       const response = await axios.post(
-        `${CONFIG.ORACLE_API_URL}/api/v2/resolve/sync`,
+        `${CONFIG.ORACLE_API_URL}/api/v1/resolve/sync`,
         {
           market_id: this.testMarketId,
           question: `Will the E2E test ${this.testMarketId} pass all verifications?`,
