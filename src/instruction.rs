@@ -729,6 +729,39 @@ pub enum PredictionMarketInstruction {
     /// 9. `[]` System Program
     RelayerCancelOrderV2(RelayerCancelOrderV2Args),
     
+    /// V2: RelayerPlaceMultiOutcomeOrder (Vault CPI for margin lock)
+    /// Place order for multi-outcome market with Vault integration
+    /// Uses outcome_index (0-31) instead of Outcome enum
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA (new)
+    /// 4. `[writable]` MultiOutcomePosition PDA
+    /// 5. `[writable]` UserAccount (Vault)
+    /// 6. `[writable]` PMUserAccount (Vault)
+    /// 7. `[]` VaultConfig
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    RelayerPlaceMultiOutcomeOrderV2(RelayerPlaceMultiOutcomeOrderV2Args),
+    
+    /// V2: RelayerCancelMultiOutcomeOrder (Vault CPI for margin unlock)
+    /// Cancel order for multi-outcome market and unlock margin or shares
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Order PDA
+    /// 4. `[writable]` MultiOutcomePosition PDA (for Sell order share unlock)
+    /// 5. `[writable]` UserAccount (Vault)
+    /// 6. `[writable]` PMUserAccount (Vault)
+    /// 7. `[]` VaultConfig
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    RelayerCancelMultiOutcomeOrderV2(RelayerCancelMultiOutcomeOrderV2Args),
+    
     // =========================================================================
     // V2 With Fee Instructions (Index 80+)
     // Fee collection integrated into Vault CPI
@@ -1365,6 +1398,41 @@ pub struct RelayerCancelOrderV2Args {
     pub market_id: u64,
     /// Order ID
     pub order_id: u64,
+}
+
+/// V2: Relayer版本的PlaceMultiOutcomeOrder (with Vault CPI)
+/// 用于多结果市场（2-32 个结果）
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerPlaceMultiOutcomeOrderV2Args {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order side (Buy/Sell)
+    pub side: OrderSide,
+    /// Outcome index (0-based, 0 to num_outcomes-1)
+    pub outcome_index: u8,
+    /// Price (e6, e.g., 250000 = $0.25)
+    pub price: u64,
+    /// Amount in tokens
+    pub amount: u64,
+    /// Order type
+    pub order_type: OrderType,
+    /// Expiration time (for GTD orders)
+    pub expiration_time: Option<i64>,
+}
+
+/// V2: Relayer版本的CancelMultiOutcomeOrder (with Vault CPI)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerCancelMultiOutcomeOrderV2Args {
+    /// 用户钱包地址
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Order ID
+    pub order_id: u64,
+    /// Outcome index (needed to unlock correct shares for Sell orders)
+    pub outcome_index: u8,
 }
 
 /// Relayer版本的ClaimWinnings
