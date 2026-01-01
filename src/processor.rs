@@ -352,6 +352,20 @@ pub fn process_instruction(
             msg!("Instruction: ChallengeResultWithEvidence");
             process_challenge_result_with_evidence(program_id, accounts, args)
         }
+        
+        // === Multi-Outcome V2 Instructions ===
+        PredictionMarketInstruction::RelayerMintMultiOutcomeCompleteSetV2(args) => {
+            msg!("Instruction: RelayerMintMultiOutcomeCompleteSetV2");
+            process_relayer_mint_multi_outcome_complete_set_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerRedeemMultiOutcomeCompleteSetV2(args) => {
+            msg!("Instruction: RelayerRedeemMultiOutcomeCompleteSetV2");
+            process_relayer_redeem_multi_outcome_complete_set_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerClaimMultiOutcomeWinningsV2(args) => {
+            msg!("Instruction: RelayerClaimMultiOutcomeWinningsV2");
+            process_relayer_claim_multi_outcome_winnings_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -6064,6 +6078,518 @@ fn process_relayer_cancel_multi_outcome_order_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Order ID: {}, Market: {}", args.order_id, args.market_id);
     msg!("Remaining amount: {}, Unlocked margin/shares: {}", remaining, remaining_margin);
+    
+    Ok(())
+}
+
+// ============================================================================
+// Multi-Outcome V2 Instructions (Vault CPI Mode)
+// ============================================================================
+
+/// V2: RelayerMintMultiOutcomeCompleteSet using Vault CPI (no SPL Token)
+/// 
+/// Mints a complete set of all outcome tokens for a multi-outcome market.
+/// 1 complete set = 1 token of each outcome
+/// Cost = amount * 1.0 USDC (locked in Vault)
+fn process_relayer_mint_multi_outcome_complete_set_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerMintMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    use crate::state::{MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR, 
+                       MULTI_OUTCOME_POSITION_SEED, MAX_OUTCOMES, MarketType};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MultiOutcomePosition PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: UserAccount (Vault, writable)
+    let user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PMUserAccount (Vault, writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: System Program
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Verify this is a multi-outcome market
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("❌ Expected MultiOutcome market, got {:?}", market.market_type);
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    if !market.is_tradeable() {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Verify MultiOutcomePosition PDA
+    let (position_pda, position_bump) = Pubkey::find_program_address(
+        &[MULTI_OUTCOME_POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        msg!("❌ Invalid MultiOutcomePosition PDA");
+        msg!("Expected: {}, Got: {}", position_pda, position_info.key);
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Step 1: CPI to Vault - PredictionMarketLock
+    msg!("CPI: Vault.PredictionMarketLock amount={}", args.amount);
+    cpi_lock_for_prediction(
+        vault_program_info,
+        vault_config_info,
+        user_account_info,
+        pm_user_account_info,
+        config_info,
+        relayer_info,
+        system_program_info,
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Create or update MultiOutcomePosition
+    let is_new_position = position_info.data_is_empty();
+    
+    if is_new_position {
+        // Create new MultiOutcomePosition account
+        let rent = Rent::get()?;
+        let space = MultiOutcomePosition::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            MULTI_OUTCOME_POSITION_SEED,
+            &market_id_bytes,
+            args.user_wallet.as_ref(),
+            &[position_bump],
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[
+                relayer_info.clone(),
+                position_info.clone(),
+                system_program_info.clone(),
+            ],
+            &[position_seeds],
+        )?;
+        
+        // Initialize MultiOutcomePosition
+        let mut position = MultiOutcomePosition::new(
+            market.market_id,
+            market.num_outcomes,
+            args.user_wallet,
+            position_bump,
+            current_time,
+        );
+        
+        // Add to all outcome holdings
+        let num_outcomes = market.num_outcomes as usize;
+        for i in 0..num_outcomes {
+            position.holdings[i] = args.amount;
+        }
+        position.total_cost_e6 = args.amount;
+        
+        position.serialize(&mut *position_info.data.borrow_mut())?;
+        msg!("✅ Created new MultiOutcomePosition");
+    } else {
+        // Update existing position
+        let mut position = deserialize_account::<MultiOutcomePosition>(&position_info.data.borrow())?;
+        
+        if position.discriminator != MULTI_OUTCOME_POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        let num_outcomes = market.num_outcomes as usize;
+        for i in 0..num_outcomes {
+            position.holdings[i] = position.holdings[i].saturating_add(args.amount);
+        }
+        position.total_cost_e6 = position.total_cost_e6.saturating_add(args.amount);
+        position.updated_at = current_time;
+        
+        position.serialize(&mut *position_info.data.borrow_mut())?;
+        msg!("✅ Updated existing MultiOutcomePosition");
+    }
+    
+    // Step 3: Update Market
+    market.total_minted = market.total_minted.saturating_add(args.amount);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerMintMultiOutcomeCompleteSetV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market: {}", market.market_id);
+    msg!("Amount: {}", args.amount);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: RelayerRedeemMultiOutcomeCompleteSet using Vault CPI (no SPL Token)
+/// 
+/// Redeems a complete set of all outcome tokens for multi-outcome market.
+/// User must have >= amount of ALL outcome tokens.
+/// Returns 1 USDC per complete set.
+fn process_relayer_redeem_multi_outcome_complete_set_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerRedeemMultiOutcomeCompleteSetArgs,
+) -> ProgramResult {
+    use crate::state::{MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR, 
+                       MULTI_OUTCOME_POSITION_SEED, MarketType};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MultiOutcomePosition PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: UserAccount (Vault, writable)
+    let user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: PMUserAccount (Vault, writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if market.market_type != MarketType::MultiOutcome {
+        msg!("❌ Expected MultiOutcome market, got {:?}", market.market_type);
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    if args.amount == 0 {
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = market.market_id.to_le_bytes();
+    
+    // Verify MultiOutcomePosition PDA
+    let (position_pda, _) = Pubkey::find_program_address(
+        &[MULTI_OUTCOME_POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        msg!("❌ Invalid MultiOutcomePosition PDA");
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load position
+    let mut position = deserialize_account::<MultiOutcomePosition>(&position_info.data.borrow())?;
+    
+    if position.discriminator != MULTI_OUTCOME_POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify user has sufficient AVAILABLE amounts of ALL outcomes
+    let num_outcomes = market.num_outcomes as usize;
+    for i in 0..num_outcomes {
+        let available = position.holdings[i].saturating_sub(position.locked[i]);
+        if available < args.amount {
+            msg!("❌ Insufficient available outcome {} tokens: available {}, need {}", 
+                 i, available, args.amount);
+            return Err(PredictionMarketError::InsufficientPosition.into());
+        }
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: Vault CPI - Unlock funds
+    msg!("CPI: Vault.PredictionMarketUnlock amount={}", args.amount);
+    cpi_release_from_prediction(
+        vault_program_info,
+        vault_config_info,
+        user_account_info,
+        pm_user_account_info,
+        config_info,
+        args.amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Update MultiOutcomePosition - reduce all holdings
+    for i in 0..num_outcomes {
+        position.holdings[i] = position.holdings[i].saturating_sub(args.amount);
+    }
+    position.total_cost_e6 = position.total_cost_e6.saturating_sub(args.amount);
+    position.updated_at = current_time;
+    
+    position.serialize(&mut *position_info.data.borrow_mut())?;
+    
+    // Step 3: Update Market
+    market.total_minted = market.total_minted.saturating_sub(args.amount);
+    market.updated_at = current_time;
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerRedeemMultiOutcomeCompleteSetV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market: {}", market.market_id);
+    msg!("Amount: {}", args.amount);
+    msg!("Total Minted: {}", market.total_minted);
+    
+    Ok(())
+}
+
+/// V2: RelayerClaimMultiOutcomeWinnings using Vault CPI (no SPL Token)
+/// 
+/// Claims winnings after market resolution for multi-outcome market.
+/// Settlement = amount of winning outcome tokens * 1 USDC
+fn process_relayer_claim_multi_outcome_winnings_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerClaimMultiOutcomeWinningsArgs,
+) -> ProgramResult {
+    use crate::state::{MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR, 
+                       MULTI_OUTCOME_POSITION_SEED, MAX_OUTCOMES, MarketType, MarketStatus};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: MultiOutcomePosition PDA (writable)
+    let position_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: PMUserAccount (Vault, writable)
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    verify_relayer(&config, relayer_info.key)?;
+    
+    // Load and validate market
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    if market.market_type != MarketType::MultiOutcome {
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    
+    // Market must be Resolved or Cancelled
+    if market.status != MarketStatus::Resolved && market.status != MarketStatus::Cancelled {
+        msg!("❌ Market status must be Resolved or Cancelled, got {:?}", market.status);
+        return Err(PredictionMarketError::MarketNotResolved.into());
+    }
+    
+    let market_id_bytes = market.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Verify MultiOutcomePosition PDA
+    let (position_pda, _) = Pubkey::find_program_address(
+        &[MULTI_OUTCOME_POSITION_SEED, &market_id_bytes, args.user_wallet.as_ref()],
+        program_id,
+    );
+    
+    if *position_info.key != position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load position
+    let mut position = deserialize_account::<MultiOutcomePosition>(&position_info.data.borrow())?;
+    
+    if position.discriminator != MULTI_OUTCOME_POSITION_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if position.settled {
+        msg!("Position already settled");
+        return Err(PredictionMarketError::AlreadySettled.into());
+    }
+    
+    // Calculate settlement
+    let locked_amount = position.total_cost_e6;
+    
+    let settlement_amount = if market.status == MarketStatus::Cancelled {
+        // Full refund on cancelled market
+        locked_amount
+    } else {
+        // Get winning outcome index
+        let winning_outcome_index = market.winning_outcome_index
+            .ok_or(PredictionMarketError::MarketNotResolved)?;
+        
+        // Winning tokens pay out 1:1
+        position.holdings[winning_outcome_index as usize]
+    };
+    
+    if settlement_amount == 0 && locked_amount == 0 {
+        msg!("No position to claim for user {}", args.user_wallet);
+        return Err(PredictionMarketError::InvalidAmount.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+    
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // Step 1: Vault CPI - Settle
+    msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
+         locked_amount, settlement_amount);
+    cpi_prediction_settle(
+        vault_program_info,
+        vault_config_info,
+        pm_user_account_info,
+        config_info,
+        locked_amount,
+        settlement_amount,
+        config_seeds,
+    )?;
+    
+    // Step 2: Update position
+    let pnl = (settlement_amount as i64) - (locked_amount as i64);
+    position.realized_pnl = position.realized_pnl.saturating_add(pnl);
+    position.settlement_amount = settlement_amount;
+    position.settled = true;
+    // Clear all holdings
+    for i in 0..MAX_OUTCOMES {
+        position.holdings[i] = 0;
+        position.locked[i] = 0;
+    }
+    position.updated_at = current_time;
+    
+    position.serialize(&mut *position_info.data.borrow_mut())?;
+    
+    msg!("✅ RelayerClaimMultiOutcomeWinningsV2 completed");
+    msg!("User: {}", args.user_wallet);
+    msg!("Market: {}", market.market_id);
+    msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
     
     Ok(())
 }

@@ -25,6 +25,7 @@ pub const MARKET_SEED: &[u8] = b"market";
 pub const ORDER_SEED: &[u8] = b"order";
 pub const ORDER_ESCROW_SEED: &[u8] = b"order_escrow";
 pub const POSITION_SEED: &[u8] = b"position";
+pub const MULTI_OUTCOME_POSITION_SEED: &[u8] = b"multi_position";
 pub const MARKET_VAULT_SEED: &[u8] = b"market_vault";
 pub const YES_MINT_SEED: &[u8] = b"yes_mint";
 pub const NO_MINT_SEED: &[u8] = b"no_mint";

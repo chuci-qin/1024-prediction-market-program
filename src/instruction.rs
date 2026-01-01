@@ -891,6 +891,53 @@ pub enum PredictionMarketInstruction {
     /// 6. `[]` Vault Config
     /// 7. `[]` Vault Program
     ChallengeResultWithEvidence(ChallengeResultWithEvidenceArgs),
+    
+    // =========================================================================
+    // Multi-Outcome V2 Instructions (Index 68-70)
+    // Pure Vault Mode for Multi-Outcome Markets
+    // =========================================================================
+
+    /// V2: RelayerMintMultiOutcomeCompleteSet (Vault CPI, no SPL Token)
+    /// Mint complete set of all outcome tokens for multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer, writable]` Relayer (also as payer for auto-init)
+    /// 1. `[]` PredictionMarketConfig (PM Config PDA, for CPI signing)
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` MultiOutcomePosition PDA
+    /// 4. `[writable]` UserAccount (Vault)
+    /// 5. `[writable]` PMUserAccount (Vault)
+    /// 6. `[]` VaultConfig
+    /// 7. `[]` Vault Program
+    /// 8. `[]` System Program
+    RelayerMintMultiOutcomeCompleteSetV2(RelayerMintMultiOutcomeCompleteSetArgs),
+
+    /// V2: RelayerRedeemMultiOutcomeCompleteSet (Vault CPI, no SPL Token)
+    /// Redeem complete set of all outcome tokens for multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` MultiOutcomePosition PDA
+    /// 4. `[writable]` UserAccount (Vault)
+    /// 5. `[writable]` PMUserAccount (Vault)
+    /// 6. `[]` VaultConfig
+    /// 7. `[]` Vault Program
+    RelayerRedeemMultiOutcomeCompleteSetV2(RelayerRedeemMultiOutcomeCompleteSetArgs),
+
+    /// V2: RelayerClaimMultiOutcomeWinnings (Vault CPI, no SPL Token)
+    /// Claim winnings after market resolution for multi-outcome market
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market (resolved)
+    /// 3. `[writable]` MultiOutcomePosition PDA
+    /// 4. `[writable]` PMUserAccount (Vault)
+    /// 5. `[]` VaultConfig
+    /// 6. `[]` Vault Program
+    RelayerClaimMultiOutcomeWinningsV2(RelayerClaimMultiOutcomeWinningsArgs),
 }
 
 // ============================================================================
