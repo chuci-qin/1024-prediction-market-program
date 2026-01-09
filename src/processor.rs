@@ -366,6 +366,12 @@ pub fn process_instruction(
             msg!("Instruction: RelayerClaimMultiOutcomeWinningsV2");
             process_relayer_claim_multi_outcome_winnings_v2(program_id, accounts, args)
         }
+        
+        // === Oracle V2 Instructions (V15.1) ===
+        PredictionMarketInstruction::FinalizeResultV2(args) => {
+            msg!("Instruction: FinalizeResultV2");
+            process_finalize_result_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -6594,3 +6600,172 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
     Ok(())
 }
 
+// ============================================================================
+// V15.1: FinalizeResultV2 - Finalize result after challenge window
+// ============================================================================
+
+/// Process FinalizeResultV2 instruction
+/// 
+/// Transitions market from ResultProposed to Resolved after challenge window expires.
+/// This is permissionless - anyone can call it after the deadline.
+/// The proposer's bond is returned via Vault CPI.
+fn process_finalize_result_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: FinalizeResultV2Args,
+) -> ProgramResult {
+    use crate::state::{OracleProposal, OracleProposalData, ORACLE_PROPOSAL_DISCRIMINATOR, 
+                       ORACLE_PROPOSAL_SEED, ORACLE_PROPOSAL_DATA_DISCRIMINATOR,
+                       ORACLE_PROPOSAL_DATA_SEED, MarketStatus, ProposalStatus};
+    
+    msg!("FinalizeResultV2: market={}", args.market_id);
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Caller (signer) - permissionless
+    let caller_info = next_account_info(account_info_iter)?;
+    check_signer(caller_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    
+    // Account 3: OracleProposal PDA (writable)
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Account 4: OracleProposalData PDA
+    let proposal_data_info = next_account_info(account_info_iter)?;
+    
+    // Account 5: Proposer's PMUserAccount (Vault, writable) - for bond return
+    let proposer_pm_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    let config_bump = config.bump;
+    
+    // Load and validate market
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Market must be in ResultProposed state
+    if market.status != MarketStatus::ResultProposed {
+        msg!("❌ Market must be in ResultProposed state, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let current_time = get_current_timestamp()?;
+    
+    // Verify OracleProposal PDA
+    let (proposal_pda, _) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and validate proposal
+    let mut proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
+    if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify OracleProposalData PDA
+    let (proposal_data_pda, _) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_data_info.key != proposal_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load proposal data
+    let proposal_data = deserialize_account::<OracleProposalData>(&proposal_data_info.data.borrow())?;
+    if proposal_data.discriminator != ORACLE_PROPOSAL_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Check if challenge window has expired (use proposal.challenge_deadline)
+    if current_time < proposal.challenge_deadline {
+        msg!("❌ Challenge window has not expired yet: current={}, deadline={}", 
+             current_time, proposal.challenge_deadline);
+        return Err(PredictionMarketError::ChallengeWindowNotExpired.into());
+    }
+    
+    // Proposal must not be disputed (check status)
+    if proposal.status == ProposalStatus::Disputed {
+        msg!("❌ Cannot finalize: proposal has been disputed");
+        return Err(PredictionMarketError::OracleDisputeInProgress.into());
+    }
+    
+    // Proposal must be in Pending status
+    if proposal.status != ProposalStatus::Pending {
+        msg!("❌ Proposal is not in Pending status, got {:?}", proposal.status);
+        return Err(PredictionMarketError::CannotFinalize.into());
+    }
+    
+    // Return proposer's bond via Vault CPI
+    // Bond was locked when proposal was created, now we release it
+    let bond_amount = proposal.bond_amount;
+    
+    if bond_amount > 0 {
+        msg!("📤 Returning proposer bond: {} e6", bond_amount);
+        
+        let config_seeds = &[
+            PM_CONFIG_SEED,
+            &[config_bump],
+        ];
+        
+        // Use settlement with locked=bond, settlement=bond (full return)
+        cpi_prediction_settle(
+            vault_program_info,
+            vault_config_info,
+            proposer_pm_account_info,
+            config_info,
+            bond_amount,  // locked_amount = bond
+            bond_amount,  // settlement_amount = bond (full return, no loss)
+            config_seeds,
+        )?;
+    }
+    
+    // Update market to Resolved
+    market.status = MarketStatus::Resolved;
+    market.final_result = Some(proposal.proposed_result);
+    market.winning_outcome_index = Some(proposal_data.proposed_outcome_index);
+    market.updated_at = current_time;
+    
+    market.serialize(&mut *market_info.data.borrow_mut())?;
+    
+    // Update proposal status to Finalized
+    proposal.status = ProposalStatus::Finalized;
+    
+    proposal.serialize(&mut *proposal_info.data.borrow_mut())?;
+    
+    msg!("✅ FinalizeResultV2 completed");
+    msg!("Market {} resolved with result {:?}, outcome index {}", 
+         market.market_id, market.final_result, proposal_data.proposed_outcome_index);
+    msg!("Bond returned: {} e6", bond_amount);
+    
+    Ok(())
+}

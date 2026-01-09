@@ -938,6 +938,28 @@ pub enum PredictionMarketInstruction {
     /// 5. `[]` VaultConfig
     /// 6. `[]` Vault Program
     RelayerClaimMultiOutcomeWinningsV2(RelayerClaimMultiOutcomeWinningsArgs),
+    
+    // =========================================================================
+    // Oracle V2 Instructions (Index 71+)
+    // V15.1: FinalizeResult replacement for automated resolution
+    // =========================================================================
+
+    /// V2: Finalize a result after challenge window expires (permissionless)
+    /// 
+    /// This instruction can be called by anyone after the challenge window has passed.
+    /// It transitions the market from ResultProposed to Resolved state.
+    /// The proposer's bond is returned via Vault CPI.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Caller (anyone, permissionless)
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` OracleProposal PDA
+    /// 4. `[]` OracleProposalData PDA
+    /// 5. `[writable]` Proposer's PMUserAccount (Vault) - for bond return
+    /// 6. `[]` VaultConfig
+    /// 7. `[]` Vault Program
+    FinalizeResultV2(FinalizeResultV2Args),
 }
 
 // ============================================================================
@@ -1679,6 +1701,13 @@ pub struct ChallengeResultWithEvidenceArgs {
     pub challenger_outcome_index: u8,
     /// Reasoning (optional, stored off-chain reference)
     pub evidence_hash: [u8; 32],
+}
+
+/// V15.1: Finalize result after challenge window (V2 - uses Vault CPI)
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct FinalizeResultV2Args {
+    /// Market ID
+    pub market_id: u64,
 }
 
 // ============================================================================
