@@ -348,6 +348,7 @@ pub const MARKET_ORACLE_DATA_DISCRIMINATOR: u64 = 0x4D4F5241434C4544; // "MORACL
 /// PDA Seeds: ["market_oracle_data", market_id.to_le_bytes()]
 /// 
 /// Task 4.3.1-4.3.7: Market structure extension via separate account
+/// V15.2: Added dynamic challenge period support
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct MarketOracleData {
     /// Account discriminator
@@ -391,12 +392,22 @@ pub struct MarketOracleData {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use
-    pub reserved: [u8; 32],
+    // =========================================================================
+    // V15.2: Dynamic Challenge Period Fields
+    // =========================================================================
+    
+    /// Challenge period duration in seconds
+    /// Calculated as: min(max(market_duration, 300), 86400)
+    /// Min: 5 minutes (300s), Max: 24 hours (86400s)
+    pub challenge_duration_secs: u32,
+    
+    /// Reserved for future use (reduced by 4 bytes for challenge_duration_secs)
+    pub reserved: [u8; 28],
 }
 
 impl MarketOracleData {
     /// Task 4.3.6: Calculate SIZE constant
+    /// V15.2: Size unchanged (challenge_duration_secs uses 4 bytes from reserved)
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 64  // creation_data_cid
@@ -409,7 +420,8 @@ impl MarketOracleData {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 32; // reserved = 267 bytes
+        + 4   // challenge_duration_secs (V15.2)
+        + 28; // reserved = 267 bytes (unchanged)
     
     /// PDA seeds
     pub fn seeds(market_id: u64) -> Vec<Vec<u8>> {
@@ -420,7 +432,8 @@ impl MarketOracleData {
     }
     
     /// Create new empty market oracle data
-    pub fn new(market_id: u64, bump: u8, current_time: i64) -> Self {
+    /// V15.2: Added challenge_duration_secs parameter
+    pub fn new(market_id: u64, bump: u8, current_time: i64, challenge_duration_secs: u32) -> Self {
         Self {
             discriminator: MARKET_ORACLE_DATA_DISCRIMINATOR,
             market_id,
@@ -434,8 +447,15 @@ impl MarketOracleData {
             created_at: current_time,
             updated_at: current_time,
             bump,
-            reserved: [0u8; 32],
+            challenge_duration_secs,
+            reserved: [0u8; 28],
         }
+    }
+    
+    /// Get challenge deadline based on proposal time
+    /// V15.2: Dynamic challenge period
+    pub fn get_challenge_deadline(&self, proposal_time: i64) -> i64 {
+        proposal_time + (self.challenge_duration_secs as i64)
     }
     
     /// Set creation data
@@ -1484,6 +1504,7 @@ impl Position {
 /// Oracle result proposal
 /// 
 /// PDA Seeds: ["oracle_proposal", market_id.to_le_bytes()]
+/// V15.2: Added dynamic challenge period support
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct OracleProposal {
     /// Account discriminator
@@ -1504,7 +1525,8 @@ pub struct OracleProposal {
     /// Proposal timestamp
     pub proposed_at: i64,
     
-    /// Challenge deadline
+    /// Challenge deadline (current effective deadline)
+    /// V15.2: This is updated when challenge_deadline is extended
     pub challenge_deadline: i64,
     
     /// Bond amount (e6)
@@ -1522,11 +1544,24 @@ pub struct OracleProposal {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use
-    pub reserved: [u8; 32],
+    // =========================================================================
+    // V15.2: Dynamic Challenge Period Fields
+    // =========================================================================
+    
+    /// Original challenge deadline (before any extensions)
+    /// V15.2: Set when proposal is created, never changes
+    pub original_challenge_deadline: i64,
+    
+    /// Number of challenges received
+    /// V15.2: Incremented each time a challenge is submitted
+    pub challenge_count: u8,
+    
+    /// Reserved for future use (reduced by 9 bytes for new fields)
+    pub reserved: [u8; 23],
 }
 
 impl OracleProposal {
+    /// V15.2: Size unchanged (new fields use space from reserved)
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 32  // proposer
@@ -1539,7 +1574,9 @@ impl OracleProposal {
         + 1 + 1 // challenger_result (Option<MarketResult>)
         + 8   // challenger_bond
         + 1   // bump
-        + 32; // reserved
+        + 8   // original_challenge_deadline (V15.2)
+        + 1   // challenge_count (V15.2)
+        + 23; // reserved = 150 bytes (unchanged)
     
     /// PDA seeds
     pub fn seeds(market_id: u64) -> Vec<Vec<u8>> {
@@ -1557,6 +1594,23 @@ impl OracleProposal {
     /// Check if proposal can be challenged
     pub fn can_challenge(&self, current_time: i64) -> bool {
         self.status == ProposalStatus::Pending && current_time < self.challenge_deadline
+    }
+    
+    /// V15.2: Extend challenge deadline
+    /// Extension = max(challenge_duration_secs, 1 hour)
+    pub fn extend_challenge_deadline(&mut self, challenge_duration_secs: u32, current_time: i64) {
+        const MIN_EXTENSION_SECS: i64 = 3600; // 1 hour
+        let extension = (challenge_duration_secs as i64).max(MIN_EXTENSION_SECS);
+        
+        // New deadline is max of (current_time + extension) and current deadline
+        let new_deadline = (current_time + extension).max(self.challenge_deadline);
+        self.challenge_deadline = new_deadline;
+        self.challenge_count = self.challenge_count.saturating_add(1);
+    }
+    
+    /// V15.2: Check if deadline has been extended
+    pub fn is_extended(&self) -> bool {
+        self.challenge_deadline > self.original_challenge_deadline
     }
 }
 

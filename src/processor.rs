@@ -5121,7 +5121,7 @@ fn process_initialize_market_oracle_data(
     
     // Initialize the account data
     let current_time = get_current_timestamp()?;
-    let oracle_data = MarketOracleData::new(args.market_id, oracle_data_bump, current_time);
+    let oracle_data = MarketOracleData::new(args.market_id, oracle_data_bump, current_time, args.challenge_duration_secs);
     oracle_data.serialize(&mut &mut oracle_data_info.data.borrow_mut()[..])?;
     
     msg!("✅ Initialized MarketOracleData for market {}", args.market_id);

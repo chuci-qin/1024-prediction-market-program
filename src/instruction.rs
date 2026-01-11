@@ -1609,10 +1609,14 @@ pub struct RelayerMatchBurnMultiArgs {
 // ============================================================================
 
 /// Initialize market oracle data account
+/// V15.2: Added challenge_duration_secs
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct InitializeMarketOracleDataArgs {
     /// Market ID
     pub market_id: u64,
+    /// Challenge period duration in seconds
+    /// V15.2: Calculated as min(max(market_duration, 300), 86400)
+    pub challenge_duration_secs: u32,
 }
 
 /// Set creation data on market
