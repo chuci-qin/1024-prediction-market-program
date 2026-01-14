@@ -121,6 +121,9 @@ pub fn cpi_release_from_prediction<'a>(
 /// This releases locked funds and adds settlement amount to pm_pending_settlement.
 /// 
 /// Vault Instruction Index: 18 (PredictionMarketSettle)
+/// 
+/// NOTE: This is the legacy version without auto-init support.
+/// Use `cpi_prediction_settle_with_auto_init` for new code.
 pub fn cpi_prediction_settle<'a>(
     vault_program: &AccountInfo<'a>,
     vault_config: &AccountInfo<'a>,
@@ -142,6 +145,59 @@ pub fn cpi_prediction_settle<'a>(
         vault_config.clone(),
         pm_user_account.clone(),
         caller_program.clone(),
+    ];
+    
+    let ix = solana_program::instruction::Instruction {
+        program_id: *vault_program.key,
+        accounts: accounts.iter().map(|a| {
+            solana_program::instruction::AccountMeta {
+                pubkey: *a.key,
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            }
+        }).collect(),
+        data,
+    };
+    
+    invoke_signed(&ix, &accounts, &[signer_seeds])?;
+    
+    Ok(())
+}
+
+/// Settle prediction market winnings with auto-init support (CPI to Vault Program)
+/// 
+/// This version supports automatic creation of PMUserAccount if it doesn't exist.
+/// Pass payer, system_program, and user_wallet for auto-init capability.
+/// 
+/// Vault Instruction Index: 18 (PredictionMarketSettle)
+pub fn cpi_prediction_settle_with_auto_init<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    user_wallet: &AccountInfo<'a>,
+    locked_amount: u64,
+    settlement_amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    msg!("CPI: Settle prediction market (with auto-init) - locked: {}, settlement: {}", 
+         locked_amount, settlement_amount);
+    
+    // Instruction index for PredictionMarketSettle = 18
+    let mut data = vec![18u8];
+    data.extend_from_slice(&locked_amount.to_le_bytes());
+    data.extend_from_slice(&settlement_amount.to_le_bytes());
+    
+    // Include optional accounts for auto-init
+    let accounts = vec![
+        vault_config.clone(),
+        pm_user_account.clone(),
+        caller_program.clone(),
+        payer.clone(),           // For paying account creation rent
+        system_program.clone(),  // System Program for create_account
+        user_wallet.clone(),     // User wallet for PDA derivation
     ];
     
     let ix = solana_program::instruction::Instruction {

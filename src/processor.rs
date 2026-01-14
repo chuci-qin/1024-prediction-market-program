@@ -35,6 +35,7 @@ use crate::cpi::{
     cpi_lock_for_prediction,
     cpi_release_from_prediction,
     cpi_prediction_settle,
+    cpi_prediction_settle_with_auto_init,
     cpi_lock_for_prediction_with_fee,
     cpi_release_from_prediction_with_fee,
     cpi_trade_with_fee,
@@ -3407,6 +3408,12 @@ fn process_execute_trade_v2(
     // Account 13: System Program
     let system_program_info = next_account_info(account_info_iter)?;
     
+    // Account 14: Buyer Wallet (用于 CPI 自动创建 PMUserAccount)
+    let buyer_wallet_info = next_account_info(account_info_iter)?;
+    
+    // Account 15: Seller Wallet (用于 CPI 自动创建 PMUserAccount)
+    let seller_wallet_info = next_account_info(account_info_iter)?;
+    
     // Load and validate config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
     if config.discriminator != PM_CONFIG_DISCRIMINATOR {
@@ -3578,27 +3585,35 @@ fn process_execute_trade_v2(
     
     // Step 1: CPI - Settle buyer (deduct from pm_locked)
     // locked=trade_cost, settlement=0
+    // 使用支持自动创建 PMUserAccount 的版本
     msg!("CPI: Settle buyer - deduct {} from pm_locked", trade_cost);
-    cpi_prediction_settle(
+    cpi_prediction_settle_with_auto_init(
         vault_program_info,
         vault_config_info,
         buyer_pm_user_info,
         config_info,
-        trade_cost,    // locked_amount to deduct
-        0,             // settlement_amount (none for buyer in trade)
+        relayer_info,           // payer for auto-init
+        system_program_info,    // system program for create_account
+        buyer_wallet_info,      // buyer wallet for PDA derivation
+        trade_cost,             // locked_amount to deduct
+        0,                      // settlement_amount (none for buyer in trade)
         config_seeds,
     )?;
     
     // Step 2: CPI - Settle seller (add to pending_settlement)
     // locked=0, settlement=trade_cost
+    // 使用支持自动创建 PMUserAccount 的版本
     msg!("CPI: Settle seller - add {} to pending_settlement", trade_cost);
-    cpi_prediction_settle(
+    cpi_prediction_settle_with_auto_init(
         vault_program_info,
         vault_config_info,
         seller_pm_user_info,
         config_info,
-        0,             // locked_amount (seller didn't lock for sell order in V2)
-        trade_cost,    // settlement_amount
+        relayer_info,           // payer for auto-init
+        system_program_info,    // system program for create_account
+        seller_wallet_info,     // seller wallet for PDA derivation
+        0,                      // locked_amount (seller didn't lock for sell order in V2)
+        trade_cost,             // settlement_amount
         config_seeds,
     )?;
     
