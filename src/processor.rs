@@ -3603,12 +3603,46 @@ fn process_execute_trade_v2(
     )?;
     
     // Step 3: Update Positions - transfer shares (seller → buyer)
-    // Load buyer position
-    let mut buyer_position = if buyer_position_info.data_len() > 0 {
-        deserialize_account::<Position>(&buyer_position_info.data.borrow())?
+    // Load or create buyer position (auto-init if empty)
+    let (_, buyer_position_bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, &market_id_bytes, buy_order.owner.as_ref()],
+        program_id,
+    );
+    
+    let mut buyer_position = if buyer_position_info.data_is_empty() {
+        // Auto-create buyer Position PDA (like MintCompleteSet does)
+        msg!("Creating buyer Position PDA (auto-init for DirectTrade)");
+        
+        let rent = Rent::get()?;
+        let space = Position::SIZE;
+        let lamports = rent.minimum_balance(space);
+        let position_seeds: &[&[u8]] = &[
+            POSITION_SEED,
+            &market_id_bytes,
+            buy_order.owner.as_ref(),
+            &[buyer_position_bump]
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                relayer_info.key,
+                buyer_position_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[relayer_info.clone(), buyer_position_info.clone(), system_program_info.clone()],
+            &[position_seeds],
+        )?;
+        
+        // Initialize new position
+        let position = Position::new(market.market_id, buy_order.owner, buyer_position_bump, current_time);
+        position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+        
+        msg!("✅ Buyer Position PDA created: {}", buyer_position_info.key);
+        position
     } else {
-        // Position should be initialized by now (via MintCompleteSet or auto-init)
-        return Err(PredictionMarketError::PositionNotFound.into());
+        deserialize_account::<Position>(&buyer_position_info.data.borrow())?
     };
     
     // Consume locked shares from seller (this unlocks and removes in one step)
