@@ -1266,14 +1266,15 @@ pub struct Position {
 }
 
 impl Position {
-    /// Account size: 146 bytes (unchanged - locked fields use reserved space)
+    /// Account size: 154 bytes
+    /// 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 16 = 154
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 32  // owner
         + 8   // yes_amount
         + 8   // no_amount
-        + 8   // yes_locked (NEW)
-        + 8   // no_locked (NEW)
+        + 8   // yes_locked
+        + 8   // no_locked
         + 8   // yes_avg_cost
         + 8   // no_avg_cost
         + 8   // realized_pnl
@@ -1283,7 +1284,7 @@ impl Position {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 16; // reserved (reduced from 32 to 16)
+        + 16; // reserved
     
     /// PDA seeds
     pub fn seeds(market_id: u64, owner: &Pubkey) -> Vec<Vec<u8>> {

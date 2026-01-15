@@ -3672,6 +3672,42 @@ fn process_execute_trade_v2(
     // Add shares to buyer
     buyer_position.add_tokens(outcome, match_amount, exec_price, current_time);
     
+    // Migrate seller Position if needed (old 146 bytes → new 154 bytes)
+    if seller_position_info.data_len() < Position::SIZE {
+        msg!("📦 Migrating seller Position: {} bytes → {} bytes", 
+             seller_position_info.data_len(), Position::SIZE);
+        seller_position_info.realloc(Position::SIZE, false)?;
+        
+        // Transfer lamports for rent-exemption if needed
+        let rent = Rent::get()?;
+        let required_lamports = rent.minimum_balance(Position::SIZE);
+        let current_lamports = seller_position_info.lamports();
+        if current_lamports < required_lamports {
+            let diff = required_lamports - current_lamports;
+            // Relayer pays for the realloc
+            **relayer_info.try_borrow_mut_lamports()? -= diff;
+            **seller_position_info.try_borrow_mut_lamports()? += diff;
+            msg!("💰 Transferred {} lamports for rent", diff);
+        }
+    }
+    
+    // Migrate buyer Position if needed (shouldn't happen since we just created it, but just in case)
+    if buyer_position_info.data_len() < Position::SIZE {
+        msg!("📦 Migrating buyer Position: {} bytes → {} bytes", 
+             buyer_position_info.data_len(), Position::SIZE);
+        buyer_position_info.realloc(Position::SIZE, false)?;
+        
+        let rent = Rent::get()?;
+        let required_lamports = rent.minimum_balance(Position::SIZE);
+        let current_lamports = buyer_position_info.lamports();
+        if current_lamports < required_lamports {
+            let diff = required_lamports - current_lamports;
+            **relayer_info.try_borrow_mut_lamports()? -= diff;
+            **buyer_position_info.try_borrow_mut_lamports()? += diff;
+            msg!("💰 Transferred {} lamports for rent", diff);
+        }
+    }
+    
     seller_position.serialize(&mut *seller_position_info.data.borrow_mut())?;
     buyer_position.serialize(&mut *buyer_position_info.data.borrow_mut())?;
     
