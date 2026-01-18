@@ -21,13 +21,14 @@ const {
   SystemProgram,
   sendAndConfirmTransaction,
 } = require('@solana/web3.js');
+const config = require('./config');
 const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
 const fs = require('fs');
 
 // Configuration
 const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
-const PM_PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
-const VAULT_PROGRAM_ID = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
+const PM_PROGRAM_ID = config.PROGRAM_ID;
+const VAULT_PROGRAM_ID = config.VAULT_PROGRAM;
 const VAULT_CONFIG = new PublicKey('rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g');
 const USDC_MINT = new PublicKey('7pCrfxhcAEyTFDhrhKRtRS2iMvEYx2dtNE7NzwuU7SA9');
 const FUND_PROGRAM = new PublicKey('FPhDzu7yCDC1BBvzGwpM6dHHNQBPpKEv6Y3Ptdc7o3fJ');

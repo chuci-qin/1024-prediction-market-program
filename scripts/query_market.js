@@ -4,9 +4,10 @@
  */
 
 const { Connection, PublicKey } = require('@solana/web3.js');
+const config = require('./config');
 
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
+const PROGRAM_ID = config.PROGRAM_ID;
+const RPC_URL = config.RPC_URL;
 const PM_CONFIG_SEED = Buffer.from('pm_config');
 const MARKET_SEED = Buffer.from('market');
 

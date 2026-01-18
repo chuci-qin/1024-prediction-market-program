@@ -960,6 +960,30 @@ pub enum PredictionMarketInstruction {
     /// 6. `[]` VaultConfig
     /// 7. `[]` Vault Program
     FinalizeResultV2(FinalizeResultV2Args),
+
+    // =========================================================================
+    // Relayer Oracle V2 Instructions (Index 72+)
+    // Relayer-signed challenge for Public API compatibility
+    // =========================================================================
+
+    /// V2: Relayer Challenge Result (Vault CPI mode)
+    /// 
+    /// Allows relayer to submit a challenge on behalf of a user.
+    /// The challenger's bond is deducted from their Vault account via CPI.
+    /// This enables Public API to submit challenges without requiring user signature.
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` OracleProposal PDA
+    /// 4. `[writable]` OracleProposalData PDA
+    /// 5. `[writable]` Challenger's UserAccount (Vault)
+    /// 6. `[writable]` Challenger's PMUserAccount (Vault) - for bond deduction
+    /// 7. `[]` VaultConfig
+    /// 8. `[]` Vault Program
+    /// 9. `[]` System Program
+    RelayerChallengeResultV2(RelayerChallengeResultV2Args),
 }
 
 // ============================================================================
@@ -1712,6 +1736,20 @@ pub struct ChallengeResultWithEvidenceArgs {
 pub struct FinalizeResultV2Args {
     /// Market ID
     pub market_id: u64,
+}
+
+/// Relayer Challenge Result V2 (Vault CPI mode)
+/// Allows relayer to challenge on behalf of user without requiring user signature
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerChallengeResultV2Args {
+    /// User wallet (challenger) - the user on whose behalf the challenge is submitted
+    pub user_wallet: Pubkey,
+    /// Market ID
+    pub market_id: u64,
+    /// Challenger's proposed outcome index (for multi-outcome markets, 0-based; for binary: 0=Yes, 1=No, 2=Invalid)
+    pub challenger_outcome_index: u8,
+    /// Evidence hash (SHA256 of evidence data, optional off-chain reference)
+    pub evidence_hash: [u8; 32],
 }
 
 // ============================================================================

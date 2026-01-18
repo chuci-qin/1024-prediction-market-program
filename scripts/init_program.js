@@ -12,10 +12,11 @@ const {
   SystemProgram,
   sendAndConfirmTransaction 
 } = require('@solana/web3.js');
+const config = require('./config');
 const fs = require('fs');
 
 // Program and account IDs
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = config.PROGRAM_ID;
 const VAULT_PROGRAM = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
 const FUND_PROGRAM = new PublicKey('FPhDzu7yCDC1BBvzGwpM6dHHNQBPpKEv6Y3Ptdc7o3fJ');
 const USDC_MINT = new PublicKey('7pCrfxhcAEyTFDhrhKRtRS2iMvEYx2dtNE7NzwuU7SA9');
@@ -58,13 +59,34 @@ async function main() {
   console.log('1024 Prediction Market Program - Initialize');
   console.log('='.repeat(60));
   
-  // Connect to local RPC
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
-  console.log('Connected to local RPC');
+  // Connect to RPC (use config or env var)
+  const connection = new Connection(config.RPC_URL, 'confirmed');
+  console.log(`Connected to RPC: ${config.RPC_URL}`);
   
-  // Load faucet keypair
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
-  const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
+  // Load faucet keypair (check multiple paths)
+  const keypairPaths = [
+    process.env.ADMIN_KEYPAIR_PATH,
+    process.env.HOME + '/Developer/1024ex/faucet.json',
+    process.env.HOME + '/1024chain-testnet/keys/faucet.json',
+    '/Users/chuciqin/Desktop/project1024/1024codebase/1024-chain/keys/faucet.json',
+  ].filter(Boolean);
+  
+  let faucetData;
+  let faucetPath;
+  for (const path of keypairPaths) {
+    try {
+      faucetData = JSON.parse(fs.readFileSync(path, 'utf-8'));
+      faucetPath = path;
+      break;
+    } catch (e) {
+      continue;
+    }
+  }
+  
+  if (!faucetData) {
+    throw new Error('Could not find faucet keypair in any known location');
+  }
+  console.log(`Loaded keypair from: ${faucetPath}`);
   const admin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Admin: ${admin.publicKey.toBase58()}`);
   

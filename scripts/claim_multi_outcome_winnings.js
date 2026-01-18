@@ -13,6 +13,7 @@ const {
   TransactionInstruction,
   sendAndConfirmTransaction,
 } = require('@solana/web3.js');
+const config = require('./config');
 const { 
   getAssociatedTokenAddress, 
   TOKEN_PROGRAM_ID,
@@ -20,7 +21,7 @@ const {
 const fs = require('fs');
 
 // Program IDs
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = config.PROGRAM_ID;
 const USDC_MINT = new PublicKey('7pCrfxhcAEyTFDhrhKRtRS2iMvEYx2dtNE7NzwuU7SA9');
 
 // Seeds

@@ -373,6 +373,12 @@ pub fn process_instruction(
             msg!("Instruction: FinalizeResultV2");
             process_finalize_result_v2(program_id, accounts, args)
         }
+        
+        // === Relayer Oracle V2 Instructions ===
+        PredictionMarketInstruction::RelayerChallengeResultV2(args) => {
+            msg!("Instruction: RelayerChallengeResultV2");
+            process_relayer_challenge_result_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -6851,6 +6857,198 @@ fn process_finalize_result_v2(
     msg!("Market {} resolved with result {:?}, outcome index {}", 
          market.market_id, market.final_result, proposal_data.proposed_outcome_index);
     msg!("Bond returned: {} e6", bond_amount);
+    
+    Ok(())
+}
+
+// ============================================================================
+// V15.2: RelayerChallengeResultV2 - Relayer-signed challenge for Public API
+// ============================================================================
+
+/// Process RelayerChallengeResultV2 instruction
+/// 
+/// Allows relayer to submit a challenge on behalf of a user.
+/// The challenger's bond is deducted from their Vault account via CPI.
+/// This enables Public API to submit challenges without requiring user signature.
+/// 
+/// Accounts:
+/// 0. `[signer]` Relayer
+/// 1. `[]` PredictionMarketConfig
+/// 2. `[writable]` Market
+/// 3. `[writable]` OracleProposal PDA
+/// 4. `[writable]` OracleProposalData PDA
+/// 5. `[writable]` Challenger's UserAccount (Vault)
+/// 6. `[writable]` Challenger's PMUserAccount (Vault) - for bond deduction
+/// 7. `[]` VaultConfig
+/// 8. `[]` Vault Program
+/// 9. `[]` System Program
+fn process_relayer_challenge_result_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: crate::instruction::RelayerChallengeResultV2Args,
+) -> ProgramResult {
+    use crate::state::{OracleProposal, OracleProposalData, ORACLE_PROPOSAL_DISCRIMINATOR, 
+                       ORACLE_PROPOSAL_SEED, ORACLE_PROPOSAL_DATA_DISCRIMINATOR,
+                       ORACLE_PROPOSAL_DATA_SEED, MarketStatus};
+    
+    msg!("RelayerChallengeResultV2: market={}, challenger={}, outcome={}", 
+         args.market_id, args.user_wallet, args.challenger_outcome_index);
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Relayer (signer)
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify relayer is authorized
+    verify_relayer(&config, relayer_info.key)?;
+    
+    let config_bump = config.bump;
+    
+    // Account 2: Market (writable)
+    let market_info = next_account_info(account_info_iter)?;
+    let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+    
+    // Market must be in ResultProposed state
+    if market.status != MarketStatus::ResultProposed {
+        msg!("Market must be in ResultProposed state to challenge, got {:?}", market.status);
+        return Err(PredictionMarketError::InvalidMarketStatus.into());
+    }
+    
+    let current_time = get_current_timestamp()?;
+    let market_id_bytes = args.market_id.to_le_bytes();
+    
+    // Account 3: OracleProposal PDA (writable)
+    let proposal_info = next_account_info(account_info_iter)?;
+    
+    // Validate OracleProposal PDA
+    let (proposal_pda, _proposal_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_info.key != proposal_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and validate OracleProposal to check challenge window
+    let proposal = deserialize_account::<OracleProposal>(&proposal_info.data.borrow())?;
+    if proposal.discriminator != ORACLE_PROPOSAL_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify within challenge window
+    let challenge_deadline = proposal.proposed_at + config.challenge_window_secs;
+    if current_time > challenge_deadline {
+        msg!("Challenge window has expired: current={}, deadline={}", current_time, challenge_deadline);
+        return Err(PredictionMarketError::ChallengeWindowExpired.into());
+    }
+    
+    // Account 4: OracleProposalData PDA (writable)
+    let proposal_data_info = next_account_info(account_info_iter)?;
+    
+    // Validate OracleProposalData PDA
+    let (proposal_data_pda, _proposal_data_bump) = Pubkey::find_program_address(
+        &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
+        program_id,
+    );
+    
+    if *proposal_data_info.key != proposal_data_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load and update OracleProposalData with challenger's outcome
+    let mut proposal_data = deserialize_account::<OracleProposalData>(&proposal_data_info.data.borrow())?;
+    if proposal_data.discriminator != ORACLE_PROPOSAL_DATA_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Challenger's outcome must differ from proposed outcome
+    if args.challenger_outcome_index == proposal_data.proposed_outcome_index {
+        msg!("Challenger outcome must differ from proposed outcome");
+        return Err(PredictionMarketError::InvalidOutcome.into());
+    }
+    
+    // Account 5: Challenger's UserAccount (Vault) - for bond lock
+    let challenger_vault_info = next_account_info(account_info_iter)?;
+    
+    // Account 6: Challenger's PMUserAccount (Vault)
+    let challenger_pm_account_info = next_account_info(account_info_iter)?;
+    
+    // Account 7: VaultConfig
+    let vault_config_info = next_account_info(account_info_iter)?;
+    
+    // Account 8: Vault Program
+    let vault_program_info = next_account_info(account_info_iter)?;
+    
+    // Account 9: System Program (for auto-init)
+    let system_program_info = next_account_info(account_info_iter)?;
+    
+    // Lock challenger's bond via Vault CPI
+    // Use the same bond amount as the proposer
+    let bond_amount = config.proposer_bond_e6;
+    
+    if bond_amount > 0 {
+        msg!("📥 Locking challenger bond: {} e6 for user {}", bond_amount, args.user_wallet);
+        
+        let config_seeds = &[
+            PM_CONFIG_SEED,
+            &[config_bump],
+        ];
+        
+        // Lock the bond from challenger's vault
+        cpi_lock_for_prediction(
+            vault_program_info,
+            vault_config_info,
+            challenger_vault_info,
+            challenger_pm_account_info,
+            config_info,
+            relayer_info,  // payer for auto-init
+            system_program_info,
+            bond_amount,
+            config_seeds,
+        )?;
+    }
+    
+    // Record challenger's outcome and evidence hash
+    proposal_data.set_challenger(args.challenger_outcome_index, current_time);
+    
+    // Store evidence hash (stored in proposal_data for reference)
+    // Note: evidence_hash is stored off-chain, we just log it here
+    msg!("Challenge evidence_hash: {:?}", &args.evidence_hash[0..8]);
+    
+    // Update market status to Challenged
+    market.status = MarketStatus::Challenged;
+    market.updated_at = current_time;
+    
+    // Serialize updated accounts
+    proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
+    market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("✅ RelayerChallengeResultV2 completed");
+    msg!("Market {} challenged by {} (via relayer), outcome={}", 
+         args.market_id, args.user_wallet, args.challenger_outcome_index);
+    msg!("Bond locked: {} e6", bond_amount);
     
     Ok(())
 }

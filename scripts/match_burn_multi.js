@@ -16,12 +16,13 @@ const {
   Transaction, 
   TransactionInstruction,
 } = require('@solana/web3.js');
+const config = require('./config');
 const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress } = require('@solana/spl-token');
 const fs = require('fs');
 
 // 1024Chain Testnet 配置
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const RPC_URL = config.RPC_URL;
+const PROGRAM_ID = config.PROGRAM_ID;
 
 // Seeds
 const PM_CONFIG_SEED = Buffer.from('pm_config');

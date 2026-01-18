@@ -17,6 +17,7 @@
  */
 
 const { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const config = require('./config');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -30,7 +31,7 @@ const CONFIG = {
   RPC_URL: process.env.RPC_URL || 'https://testnet-rpc.1024chain.com/rpc/',
   
   // Program IDs
-  PREDICTION_MARKET_PROGRAM: new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58'),
+  PREDICTION_MARKET_PROGRAM: config.PROGRAM_ID,
   VAULT_PROGRAM: new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny'),
   
   // Oracle API

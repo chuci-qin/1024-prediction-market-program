@@ -4,8 +4,9 @@
  */
 
 const { Connection, PublicKey } = require('@solana/web3.js');
+const config = require('./config');
 
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = config.PROGRAM_ID;
 const PROPOSAL_SEED = Buffer.from('oracle_proposal');
 
 async function main() {

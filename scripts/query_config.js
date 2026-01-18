@@ -3,11 +3,12 @@
  */
 
 const { Connection, PublicKey } = require('@solana/web3.js');
+const config = require('./config');
 
 // 新的 Program ID (V3 - 2025-12-12)
-const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
+const PROGRAM_ID = config.PROGRAM_ID;
 const PM_CONFIG_SEED = Buffer.from('pm_config');
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = config.RPC_URL;
 
 async function main() {
   console.log('='.repeat(60));
