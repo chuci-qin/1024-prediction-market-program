@@ -23,7 +23,7 @@ async function main() {
   console.log(`1024 Prediction Market - Query Order ${marketId}/${orderId}`);
   console.log('='.repeat(60));
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   
   // Derive Order PDA
   const marketIdBytes = Buffer.alloc(8);

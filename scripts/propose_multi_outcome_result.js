@@ -65,11 +65,11 @@ async function main() {
   console.log(`Winning Outcome Index: ${winningOutcomeIndex}`);
   console.log('');
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   console.log('Connected to local RPC');
   
   // Load oracle admin keypair (same as faucet/admin)
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
+  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const oracleAdmin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Oracle Admin: ${oracleAdmin.publicKey.toBase58()}`);

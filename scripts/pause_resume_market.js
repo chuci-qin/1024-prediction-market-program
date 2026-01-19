@@ -38,9 +38,9 @@ async function main() {
   console.log(`1024 Prediction Market - ${action.toUpperCase()} Market ${marketId}`);
   console.log('='.repeat(60));
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
+  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const admin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Admin: ${admin.publicKey.toBase58()}`);

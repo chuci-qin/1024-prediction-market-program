@@ -16,7 +16,7 @@ async function main() {
   console.log(`1024 Prediction Market - Query Proposal ${marketId}`);
   console.log('='.repeat(60));
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   
   const marketIdBytes = Buffer.alloc(8);
   marketIdBytes.writeBigUInt64LE(BigInt(marketId));

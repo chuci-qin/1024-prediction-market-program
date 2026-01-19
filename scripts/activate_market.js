@@ -29,7 +29,8 @@ const MARKET_SEED = Buffer.from('market');
  */
 function serializeActivateMarketArgs(marketId) {
   const buffer = Buffer.alloc(1 + 8);
-  buffer.writeUInt8(2, 0); // Instruction index = 2
+  // 0=Initialize, 1=ReinitializeConfig, 2=CreateMarket, 3=ActivateMarket
+  buffer.writeUInt8(3, 0); // Instruction index = 3
   buffer.writeBigUInt64LE(BigInt(marketId), 1);
   return buffer;
 }
@@ -41,11 +42,11 @@ async function main() {
   console.log(`1024 Prediction Market - Activate Market ${marketId}`);
   console.log('='.repeat(60));
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   console.log('Connected to local RPC');
   
   // Load admin keypair
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
+  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const admin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Admin: ${admin.publicKey.toBase58()}`);

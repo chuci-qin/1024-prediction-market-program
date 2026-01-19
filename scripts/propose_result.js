@@ -60,10 +60,10 @@ async function main() {
   console.log(`Market ID: ${marketId}`);
   console.log(`Proposed Result: ${resultNames[result]} (${result})`);
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   
   // Use faucet as oracle admin (since they initialized the program)
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
+  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const oracleAdmin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`\nOracle Admin: ${oracleAdmin.publicKey.toBase58()}`);

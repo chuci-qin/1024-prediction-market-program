@@ -41,8 +41,9 @@ function serializeCreateMarketArgs(questionHash, resolutionSpecHash, resolutionT
   const buffer = Buffer.alloc(1 + 32 + 32 + 8 + 8 + 2); // 83 bytes
   let offset = 0;
   
-  // Instruction index = 1 (CreateMarket)
-  buffer.writeUInt8(1, offset);
+  // Instruction index = 2 (CreateMarket is the 3rd variant in the enum)
+  // 0 = Initialize, 1 = ReinitializeConfig, 2 = CreateMarket
+  buffer.writeUInt8(2, offset);
   offset += 1;
   
   // Question hash (32 bytes)
@@ -85,11 +86,11 @@ async function main() {
   console.log('1024 Prediction Market - Create Market Test');
   console.log('='.repeat(60));
   
-  const connection = new Connection('http://127.0.0.1:8899', 'confirmed');
+  const connection = new Connection(config.RPC_URL, 'confirmed');
   console.log('Connected to local RPC');
   
   // Load admin keypair
-  const faucetPath = process.env.HOME + '/1024chain-testnet/keys/faucet.json';
+  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const admin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Admin/Creator: ${admin.publicKey.toBase58()}`);
