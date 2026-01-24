@@ -2613,9 +2613,13 @@ fn process_match_mint_v2(
         return Err(PredictionMarketError::MarketNotTradeable.into());
     }
     
-    // Validate price pair for minting: yes_price + no_price <= 1.0
-    if args.yes_price + args.no_price > PRICE_PRECISION {
-        msg!("Price sum {} + {} > 1.0, not valid for minting", args.yes_price, args.no_price);
+    // Validate price pair for minting: yes_price + no_price == 1.0 (exactly 100¢)
+    // This ensures perfect fund balance: $1 locked = $1 settlement
+    // - < 100¢ would cause fund shortage at settlement
+    // - > 100¢ would require complex excess fund handling
+    if args.yes_price + args.no_price != PRICE_PRECISION {
+        msg!("Price sum {} + {} != 1.0, not valid for minting (must be exactly 100¢)", 
+             args.yes_price, args.no_price);
         return Err(PredictionMarketError::InvalidPricePair.into());
     }
     
@@ -3891,10 +3895,11 @@ fn process_match_mint_multi_v2(
         return Err(PredictionMarketError::InvalidArgument.into());
     }
     
-    // Validate price sum <= 1.0 (price conservation for minting)
+    // Validate price sum == 1.0 (exactly 100¢ for perfect fund balance)
+    // This ensures $1 locked = $1 settlement, avoiding fund shortage or excess
     let total_price: u64 = args.orders.iter().map(|(_, _, p)| p).sum();
-    if total_price > PRICE_PRECISION {
-        msg!("Total price {} > 1.0 ({})", total_price, PRICE_PRECISION);
+    if total_price != PRICE_PRECISION {
+        msg!("Total price {} != 1.0 ({}) - must be exactly 100¢", total_price, PRICE_PRECISION);
         return Err(PredictionMarketError::InvalidPricePair.into());
     }
     
