@@ -16,6 +16,8 @@ test-sbf = []
 cpi = ["no-entrypoint"]
 
 [dependencies]
+# 保持 Solana 1.18 + Borsh 0.10 稳定版本（链上程序）
+# 后端使用手动反序列化兼容 Borsh 0.10 格式
 solana-program = "=1.18.26"
 borsh = "0.10"
 borsh-derive = "0.10"
