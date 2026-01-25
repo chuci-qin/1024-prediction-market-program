@@ -146,7 +146,7 @@ async function main() {
   const keypairPaths = [
     process.env.KEYPAIR_PATH,
     '/Users/chuciqin/Desktop/project1024/1024codebase/1024-chain/keys/faucet.json',
-    '/Users/patrick/Developer/1024ex/faucet.json',
+    process.env.ADMIN_KEYPAIR || '../faucet.json',
   ].filter(Boolean);
   
   let callerPath;

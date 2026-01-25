@@ -60,7 +60,7 @@ async function main() {
   
   const connection = new Connection(config.RPC_URL, 'confirmed');
   
-  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
+  const faucetPath = process.env.ADMIN_KEYPAIR || '../faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const creator = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Creator: ${creator.publicKey.toBase58()}`);

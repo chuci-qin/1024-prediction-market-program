@@ -92,7 +92,7 @@ async function main() {
   const dbUrl = process.env.DATABASE_URL;
   if (!dbUrl) {
     console.error('❌ DATABASE_URL 环境变量未设置');
-    console.log('请先运行: source /Users/patrick/Developer/1024ex/1024-core/.env');
+    console.log('请先运行: source ../1024-core/.env 或设置 DATABASE_URL 环境变量');
     process.exit(1);
   }
   

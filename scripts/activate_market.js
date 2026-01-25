@@ -46,7 +46,7 @@ async function main() {
   console.log('Connected to local RPC');
   
   // Load admin keypair
-  const faucetPath = '/Users/patrick/Developer/1024ex/faucet.json';
+  const faucetPath = process.env.ADMIN_KEYPAIR || '../faucet.json';
   const faucetData = JSON.parse(fs.readFileSync(faucetPath, 'utf-8'));
   const admin = Keypair.fromSecretKey(new Uint8Array(faucetData));
   console.log(`Admin: ${admin.publicKey.toBase58()}`);
