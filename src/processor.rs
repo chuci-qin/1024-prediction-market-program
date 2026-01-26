@@ -379,6 +379,12 @@ pub fn process_instruction(
             msg!("Instruction: RelayerChallengeResultV2");
             process_relayer_challenge_result_v2(program_id, accounts, args)
         }
+        
+        // === Multi-Outcome Direct Trade V2 ===
+        PredictionMarketInstruction::ExecuteMultiOutcomeTradeV2(args) => {
+            msg!("Instruction: ExecuteMultiOutcomeTradeV2");
+            process_execute_multi_outcome_trade_v2(program_id, accounts, args)
+        }
     }
 }
 
@@ -3800,6 +3806,274 @@ fn process_execute_trade_v2(
     msg!("Amount: {}, Price: {}, Cost: {}", match_amount, exec_price, trade_cost);
     msg!("Buyer: {}", buy_order.owner);
     msg!("Seller: {}", sell_order.owner);
+    
+    Ok(())
+}
+
+/// V2: ExecuteMultiOutcomeTrade using Vault CPI (no SPL Token)
+/// 
+/// Direct trade between buyer and seller for multi-outcome markets:
+/// - Buyer has USDC locked in pm_locked (from RelayerPlaceMultiOutcomeOrderV2)
+/// - Seller has virtual shares in MultiOutcomePosition PDA
+/// - Trade transfers USDC (buyer → seller) and shares (seller → buyer)
+/// 
+/// Key differences from ExecuteTradeV2:
+/// 1. Uses MULTI_OUTCOME_POSITION_SEED for Position PDA derivation
+/// 2. Deserializes MultiOutcomePosition (893 bytes) instead of Position (154 bytes)
+/// 3. Uses holdings[outcome_index] / locked[outcome_index] instead of yes_amount/no_amount
+/// 
+/// Flow:
+/// 1. Validate orders (same outcome_index, price compatible, sufficient amounts)
+/// 2. Validate seller has sufficient locked shares in MultiOutcomePosition
+/// 3. CPI: Settle buyer (locked=cost, settlement=0) - deduct from buyer's pm_locked
+/// 4. CPI: Settle seller (locked=0, settlement=cost) - add to seller's pending_settlement  
+/// 5. Update MultiOutcomePositions: transfer shares from seller to buyer
+/// 6. Update Orders: mark filled/partial_filled
+fn process_execute_multi_outcome_trade_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: ExecuteMultiOutcomeTradeV2Args,
+) -> ProgramResult {
+    use crate::state::{MULTI_OUTCOME_POSITION_SEED};
+    
+    let account_info_iter = &mut accounts.iter();
+    
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+    
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let buy_order_info = next_account_info(account_info_iter)?;
+    let sell_order_info = next_account_info(account_info_iter)?;
+    let buyer_position_info = next_account_info(account_info_iter)?;
+    let seller_position_info = next_account_info(account_info_iter)?;
+    let _buyer_vault_info = next_account_info(account_info_iter)?;
+    let buyer_pm_user_info = next_account_info(account_info_iter)?;
+    let _seller_vault_info = next_account_info(account_info_iter)?;
+    let seller_pm_user_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+    let system_program_info = next_account_info(account_info_iter)?;
+    let buyer_wallet_info = next_account_info(account_info_iter)?;
+    let seller_wallet_info = next_account_info(account_info_iter)?;
+    
+    // Load config (small struct, ok on stack)
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    verify_relayer(&config, relayer_info.key)?;
+    if config.is_paused {
+        return Err(PredictionMarketError::ProgramPaused.into());
+    }
+    
+    // Verify Market PDA and load market in a scope to limit lifetime
+    let market_id_bytes = args.market_id.to_le_bytes();
+    let (market_pda, _) = Pubkey::find_program_address(&[MARKET_SEED, &market_id_bytes], program_id);
+    if *market_info.key != market_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Extract market info we need, then drop the large struct
+    let (market_id, num_outcomes, is_tradeable, is_multi_outcome) = {
+        let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        (market.market_id, market.num_outcomes, market.is_tradeable(), market.market_type == MarketType::MultiOutcome)
+    };
+    
+    if !is_tradeable {
+        return Err(PredictionMarketError::MarketNotTradeable.into());
+    }
+    if !is_multi_outcome {
+        return Err(PredictionMarketError::InvalidMarketType.into());
+    }
+    if args.outcome_index >= num_outcomes {
+        return Err(PredictionMarketError::InvalidOutcome.into());
+    }
+    
+    // Verify Order PDAs
+    let buy_order_id_bytes = args.buy_order_id.to_le_bytes();
+    let (buy_order_pda, _) = Pubkey::find_program_address(&[ORDER_SEED, &market_id_bytes, &buy_order_id_bytes], program_id);
+    if *buy_order_info.key != buy_order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let sell_order_id_bytes = args.sell_order_id.to_le_bytes();
+    let (sell_order_pda, _) = Pubkey::find_program_address(&[ORDER_SEED, &market_id_bytes, &sell_order_id_bytes], program_id);
+    if *sell_order_info.key != sell_order_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Load orders and extract what we need
+    let (buyer_owner, seller_owner, match_amount, exec_price, trade_cost) = {
+        let buy_order = deserialize_account::<Order>(&buy_order_info.data.borrow())?;
+        let sell_order = deserialize_account::<Order>(&sell_order_info.data.borrow())?;
+        
+        if buy_order.discriminator != ORDER_DISCRIMINATOR || sell_order.discriminator != ORDER_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        if buy_order.side != crate::state::OrderSide::Buy {
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        if sell_order.side != crate::state::OrderSide::Sell {
+            return Err(PredictionMarketError::InvalidOrderSide.into());
+        }
+        if buy_order.outcome_index != sell_order.outcome_index || buy_order.outcome_index != args.outcome_index {
+            return Err(PredictionMarketError::OutcomeMismatch.into());
+        }
+        if !buy_order.is_active() || !sell_order.is_active() {
+            return Err(PredictionMarketError::OrderNotActive.into());
+        }
+        if buy_order.price < sell_order.price {
+            return Err(PredictionMarketError::PriceMismatch.into());
+        }
+        
+        let match_amt = args.amount.min(buy_order.remaining_amount()).min(sell_order.remaining_amount());
+        if match_amt == 0 {
+            return Err(PredictionMarketError::NoMatchableAmount.into());
+        }
+        
+        let price = args.price;
+        if price < sell_order.price || price > buy_order.price {
+            return Err(PredictionMarketError::InvalidExecutionPrice.into());
+        }
+        
+        let cost = ((match_amt as u128) * (price as u128) / (PRICE_PRECISION as u128)) as u64;
+        
+        (buy_order.owner, sell_order.owner, match_amt, price, cost)
+    };
+    
+    let current_time = get_current_timestamp()?;
+    
+    msg!("V2 MultiOutcome DirectTrade: m={}, o={}, amt={}, cost={}", 
+         args.market_id, args.outcome_index, match_amount, trade_cost);
+    
+    // Verify Position PDAs
+    let (buyer_position_pda, buyer_position_bump) = Pubkey::find_program_address(
+        &[MULTI_OUTCOME_POSITION_SEED, &market_id_bytes, buyer_owner.as_ref()],
+        program_id,
+    );
+    if *buyer_position_info.key != buyer_position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    let (seller_position_pda, _) = Pubkey::find_program_address(
+        &[MULTI_OUTCOME_POSITION_SEED, &market_id_bytes, seller_owner.as_ref()],
+        program_id,
+    );
+    if *seller_position_info.key != seller_position_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    
+    // Derive Config PDA for CPI signing
+    let (config_pda, config_bump) = Pubkey::find_program_address(&[PM_CONFIG_SEED], program_id);
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+    
+    // CPI: Settle buyer (deduct from pm_locked)
+    cpi_prediction_settle_with_auto_init(
+        vault_program_info, vault_config_info, buyer_pm_user_info, config_info,
+        relayer_info, system_program_info, buyer_wallet_info,
+        trade_cost, 0, config_seeds,
+    )?;
+    
+    // CPI: Settle seller (add to pending_settlement)
+    cpi_prediction_settle_with_auto_init(
+        vault_program_info, vault_config_info, seller_pm_user_info, config_info,
+        relayer_info, system_program_info, seller_wallet_info,
+        0, trade_cost, config_seeds,
+    )?;
+    
+    // Update positions - process seller first, then buyer (each in its own scope)
+    // This ensures only one MultiOutcomePosition (893 bytes) is on stack at a time
+    let outcome_idx = args.outcome_index as usize;
+    
+    // Scope 1: Update seller position
+    {
+        use crate::state::{MultiOutcomePosition, MULTI_OUTCOME_POSITION_DISCRIMINATOR};
+        let mut data = seller_position_info.data.borrow_mut();
+        let mut pos = deserialize_account::<MultiOutcomePosition>(&data)?;
+        if pos.discriminator != MULTI_OUTCOME_POSITION_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        if pos.locked[outcome_idx] < match_amount {
+            return Err(PredictionMarketError::InsufficientPosition.into());
+        }
+        pos.consume_locked_shares(args.outcome_index, match_amount, exec_price, current_time)
+            .map_err(|_| PredictionMarketError::InsufficientPosition)?;
+        pos.serialize(&mut &mut data[..])?;
+    }
+    
+    // Scope 2: Update or create buyer position
+    {
+        use crate::state::{MultiOutcomePosition, MULTI_OUTCOME_POSITION_SEED};
+        if buyer_position_info.data_is_empty() {
+            let rent = Rent::get()?;
+            let space = MultiOutcomePosition::SIZE;
+            let lamports = rent.minimum_balance(space);
+            let position_seeds: &[&[u8]] = &[
+                MULTI_OUTCOME_POSITION_SEED,
+                &market_id_bytes,
+                buyer_owner.as_ref(),
+                &[buyer_position_bump]
+            ];
+            invoke_signed(
+                &system_instruction::create_account(
+                    relayer_info.key, buyer_position_info.key,
+                    lamports, space as u64, program_id,
+                ),
+                &[relayer_info.clone(), buyer_position_info.clone(), system_program_info.clone()],
+                &[position_seeds],
+            )?;
+            let mut pos = MultiOutcomePosition::new(market_id, num_outcomes, buyer_owner, buyer_position_bump, current_time);
+            pos.add_tokens(args.outcome_index, match_amount, exec_price, current_time);
+            pos.serialize(&mut *buyer_position_info.data.borrow_mut())?;
+        } else {
+            let mut data = buyer_position_info.data.borrow_mut();
+            let mut pos = deserialize_account::<MultiOutcomePosition>(&data)?;
+            pos.add_tokens(args.outcome_index, match_amount, exec_price, current_time);
+            pos.serialize(&mut &mut data[..])?;
+        }
+    }
+    
+    // Update orders
+    {
+        let mut buy_order = deserialize_account::<Order>(&buy_order_info.data.borrow())?;
+        buy_order.filled_amount += match_amount;
+        buy_order.status = if buy_order.filled_amount >= buy_order.amount {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartialFilled
+        };
+        buy_order.updated_at = current_time;
+        buy_order.serialize(&mut *buy_order_info.data.borrow_mut())?;
+    }
+    
+    {
+        let mut sell_order = deserialize_account::<Order>(&sell_order_info.data.borrow())?;
+        sell_order.filled_amount += match_amount;
+        sell_order.status = if sell_order.filled_amount >= sell_order.amount {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartialFilled
+        };
+        sell_order.updated_at = current_time;
+        sell_order.serialize(&mut *sell_order_info.data.borrow_mut())?;
+    }
+    
+    // Update market stats
+    {
+        let mut market = deserialize_account::<Market>(&market_info.data.borrow())?;
+        market.total_volume_e6 = market.total_volume_e6.saturating_add(trade_cost as i64);
+        market.updated_at = current_time;
+        market.serialize(&mut *market_info.data.borrow_mut())?;
+    }
+    
+    msg!("✅ ExecuteMultiOutcomeTradeV2: m={}, amt={}", args.market_id, match_amount);
     
     Ok(())
 }

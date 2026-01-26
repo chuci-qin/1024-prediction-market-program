@@ -984,6 +984,38 @@ pub enum PredictionMarketInstruction {
     /// 8. `[]` Vault Program
     /// 9. `[]` System Program
     RelayerChallengeResultV2(RelayerChallengeResultV2Args),
+
+    // =========================================================================
+    // Multi-Outcome Direct Trade V2 (Index 73+)
+    // Direct trade between buyer and seller in multi-outcome markets
+    // =========================================================================
+
+    /// V2: ExecuteMultiOutcomeTrade (Vault CPI, no SPL Token)
+    /// Direct trade for multi-outcome markets using Vault accounting
+    /// 
+    /// Similar to ExecuteTradeV2 but:
+    /// - Uses MULTI_OUTCOME_POSITION_SEED for Position PDA derivation
+    /// - Deserializes MultiOutcomePosition (893 bytes)
+    /// - Uses holdings[outcome_index] / locked[outcome_index] instead of yes_amount/no_amount
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Relayer/Keeper
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[writable]` Market
+    /// 3. `[writable]` Buy Order PDA
+    /// 4. `[writable]` Sell Order PDA
+    /// 5. `[writable]` Buyer MultiOutcomePosition PDA
+    /// 6. `[writable]` Seller MultiOutcomePosition PDA
+    /// 7. `[writable]` Buyer UserAccount (Vault)
+    /// 8. `[writable]` Buyer PMUserAccount (Vault)
+    /// 9. `[writable]` Seller UserAccount (Vault)
+    /// 10. `[writable]` Seller PMUserAccount (Vault)
+    /// 11. `[]` VaultConfig
+    /// 12. `[]` Vault Program
+    /// 13. `[]` System Program
+    /// 14. `[]` Buyer Wallet
+    /// 15. `[]` Seller Wallet
+    ExecuteMultiOutcomeTradeV2(ExecuteMultiOutcomeTradeV2Args),
 }
 
 // ============================================================================
@@ -1750,6 +1782,28 @@ pub struct RelayerChallengeResultV2Args {
     pub challenger_outcome_index: u8,
     /// Evidence hash (SHA256 of evidence data, optional off-chain reference)
     pub evidence_hash: [u8; 32],
+}
+
+// ============================================================================
+// Multi-Outcome Direct Trade V2 Args
+// ============================================================================
+
+/// V2: ExecuteMultiOutcomeTrade 参数
+/// Direct trade for multi-outcome markets using Vault accounting
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ExecuteMultiOutcomeTradeV2Args {
+    /// Market ID
+    pub market_id: u64,
+    /// Outcome index (0-based, 0..N-1)
+    pub outcome_index: u8,
+    /// Buy order ID (taker)
+    pub buy_order_id: u64,
+    /// Sell order ID (maker)
+    pub sell_order_id: u64,
+    /// Amount to trade
+    pub amount: u64,
+    /// Execution price (e6)
+    pub price: u64,
 }
 
 // ============================================================================
