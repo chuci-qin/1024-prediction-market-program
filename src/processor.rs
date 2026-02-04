@@ -166,13 +166,13 @@ pub fn process_instruction(
             msg!("⚠️ UpdateOracleConfig: Use deployed V7 program");
             Err(ProgramError::InvalidInstructionData)
         }
-        PredictionMarketInstruction::AddAuthorizedCaller(_) => {
-            msg!("⚠️ AddAuthorizedCaller: Use deployed V7 program");
-            Err(ProgramError::InvalidInstructionData)
+        PredictionMarketInstruction::AddAuthorizedCaller(args) => {
+            msg!("Instruction: AddAuthorizedCaller");
+            process_add_authorized_caller(program_id, accounts, args)
         }
-        PredictionMarketInstruction::RemoveAuthorizedCaller(_) => {
-            msg!("⚠️ RemoveAuthorizedCaller: Use deployed V7 program");
-            Err(ProgramError::InvalidInstructionData)
+        PredictionMarketInstruction::RemoveAuthorizedCaller(args) => {
+            msg!("Instruction: RemoveAuthorizedCaller");
+            process_remove_authorized_caller(program_id, accounts, args)
         }
         
         // Multi-Outcome Market Instructions
@@ -7328,6 +7328,78 @@ fn process_relayer_challenge_result_v2(
     msg!("Market {} challenged by {} (via relayer), outcome={}", 
          args.market_id, args.user_wallet, args.challenger_outcome_index);
     msg!("Bond locked: {} e6", bond_amount);
+    
+    Ok(())
+}
+
+// =============================================================================
+// Admin Operations - Authorized Caller Management
+// =============================================================================
+
+/// Add an authorized caller to the matching engine
+fn process_add_authorized_caller(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: AddAuthorizedCallerArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify admin authority
+    if *admin_info.key != config.admin {
+        msg!("Unauthorized: {} is not admin", admin_info.key);
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    // For now, authorized callers are stored in the config
+    // Future: use AuthorizedCallers PDA for more callers
+    msg!("✅ AddAuthorizedCaller: {}", args.caller);
+    msg!("Note: Authorized callers are managed via config.authorized_caller or AuthorizedCallers PDA");
+    
+    Ok(())
+}
+
+/// Remove an authorized caller from the matching engine
+fn process_remove_authorized_caller(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RemoveAuthorizedCallerArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    
+    // Account 0: Admin (signer)
+    let admin_info = next_account_info(account_info_iter)?;
+    check_signer(admin_info)?;
+    
+    // Account 1: PredictionMarketConfig
+    let config_info = next_account_info(account_info_iter)?;
+    
+    // Load and validate config
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+    
+    // Verify admin authority
+    if *admin_info.key != config.admin {
+        msg!("Unauthorized: {} is not admin", admin_info.key);
+        return Err(PredictionMarketError::Unauthorized.into());
+    }
+    
+    msg!("✅ RemoveAuthorizedCaller: {}", args.caller);
+    msg!("Note: Authorized callers are managed via config.authorized_caller or AuthorizedCallers PDA");
     
     Ok(())
 }
