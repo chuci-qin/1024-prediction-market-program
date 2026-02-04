@@ -41,6 +41,7 @@ use crate::cpi::{
     cpi_trade_with_fee,
     cpi_settle_with_fee,
 };
+use crate::token_compat;
 
 /// Process an instruction
 pub fn process_instruction(
@@ -1546,20 +1547,17 @@ fn process_mint_complete_set(
     // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
     // This V1 instruction does not collect fees
     
-    // Transfer USDC from user to market vault
-    invoke(
-        &spl_token::instruction::transfer(
-            token_program_info.key,
-            user_usdc_info.key,
-            market_vault_info.key,
-            user_info.key,
-            &[],
-            args.amount,
-        )?,
-        &[user_usdc_info.clone(), market_vault_info.clone(), user_info.clone(), token_program_info.clone()],
+    // Transfer USDC from user to market vault - 使用 token_compat 支持 Token-2022
+    token_compat::transfer(
+        token_program_info,
+        user_usdc_info,
+        market_vault_info,
+        user_info,
+        args.amount,
+        None, // 用户签名，不需要 PDA seeds
     )?;
     
-    // Mint YES tokens to user
+    // Mint YES tokens to user (Outcome Token 使用 Token-v1)
     invoke_signed(
         &spl_token::instruction::mint_to(
             token_program_info.key,
@@ -1807,18 +1805,14 @@ fn process_redeem_complete_set(
     // NOTE: Fee collection will be implemented in Vault Program layer (V2 architecture)
     // This V1 instruction does not collect fees
     
-    // Transfer USDC from market vault to user
-    invoke_signed(
-        &spl_token::instruction::transfer(
-            token_program_info.key,
-            market_vault_info.key,
-            user_usdc_info.key,
-            market_info.key, // owner
-            &[],
-            args.amount,
-        )?,
-        &[market_vault_info.clone(), user_usdc_info.clone(), market_info.clone(), token_program_info.clone()],
-        &[market_seeds],
+    // Transfer USDC from market vault to user - 使用 token_compat 支持 Token-2022
+    token_compat::transfer(
+        token_program_info,
+        market_vault_info,
+        user_usdc_info,
+        market_info,
+        args.amount,
+        Some(market_seeds),
     )?;
     
     // Update position

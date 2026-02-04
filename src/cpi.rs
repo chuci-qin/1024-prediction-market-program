@@ -614,10 +614,14 @@ pub fn verify_fund_program(
     Ok(())
 }
 
-/// Verify SPL Token Program
+/// Verify SPL Token Program (supports both Token-v1 and Token-2022)
 pub fn verify_token_program(provided: &Pubkey) -> ProgramResult {
-    if provided != &spl_token::id() {
-        msg!("Token program mismatch: expected {}, got {}", spl_token::id(), provided);
+    // Token-2022 Program ID
+    const TOKEN_PROGRAM_V2: Pubkey = solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+    
+    if provided != &spl_token::id() && provided != &TOKEN_PROGRAM_V2 {
+        msg!("Token program mismatch: expected {} or {}, got {}", 
+             spl_token::id(), TOKEN_PROGRAM_V2, provided);
         return Err(ProgramError::IncorrectProgramId);
     }
     Ok(())
@@ -629,7 +633,14 @@ mod tests {
 
     #[test]
     fn test_verify_token_program() {
+        // Token-v1 should be accepted
         assert!(verify_token_program(&spl_token::id()).is_ok());
+        
+        // Token-2022 should be accepted
+        const TOKEN_PROGRAM_V2: Pubkey = solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+        assert!(verify_token_program(&TOKEN_PROGRAM_V2).is_ok());
+        
+        // Random pubkey should be rejected
         assert!(verify_token_program(&Pubkey::new_unique()).is_err());
     }
 }
