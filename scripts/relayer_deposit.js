@@ -16,7 +16,7 @@ const {
 const fs = require('fs');
 
 // Configuration
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = 'https://rpc-testnet.1024chain.com/rpc/';
 const VAULT_PROGRAM_ID = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
 const VAULT_CONFIG_PDA = new PublicKey('rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g');
 

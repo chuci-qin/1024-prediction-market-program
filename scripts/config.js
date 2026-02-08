@@ -21,7 +21,7 @@ const { PublicKey } = require('@solana/web3.js');
 // Network Configuration
 // ============================================================================
 
-const RPC_URL = process.env.SOLANA_RPC_URL || 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = process.env.SOLANA_RPC_URL || 'https://rpc-testnet.1024chain.com/rpc/';
 const COMMITMENT = 'confirmed';
 
 // ============================================================================

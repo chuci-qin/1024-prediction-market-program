@@ -17,7 +17,7 @@ import * as fs from 'fs';
 
 // Constants
 const PROGRAM_ID = new PublicKey('FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58');
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = 'https://rpc-testnet.1024chain.com/rpc/';
 
 // Vault Program (existing)
 const VAULT_PROGRAM = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');

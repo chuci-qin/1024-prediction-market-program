@@ -45,7 +45,7 @@ const VAULT_CONFIG_PDA = new PublicKey(process.env.VAULT_CONFIG_PDA || 'rMLrkwxV
 const PM_PROGRAM_ID = new PublicKey(process.env.PM_PROGRAM_ID || '9hsG1DksmgadjjJTEEX7CdevQKYVkQag3mEratPRZXjv');
 // PM Config PDA - this is what actually makes CPI calls to Vault
 const [PM_CONFIG_PDA] = PublicKey.findProgramAddressSync([Buffer.from('pm_config')], PM_PROGRAM_ID);
-const RPC_URL = process.env.SOLANA_RPC_URL || 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = process.env.SOLANA_RPC_URL || 'https://rpc-testnet.1024chain.com/rpc/';
 
 // Vault instruction indices for authorized caller management
 // Based on VaultInstruction enum:

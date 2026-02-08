@@ -26,7 +26,7 @@ const { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createAssociatedTokenAccoun
 const fs = require('fs');
 
 // Configuration
-const RPC_URL = 'https://testnet-rpc.1024chain.com/rpc/';
+const RPC_URL = 'https://rpc-testnet.1024chain.com/rpc/';
 const PM_PROGRAM_ID = config.PROGRAM_ID;
 const VAULT_PROGRAM_ID = config.VAULT_PROGRAM;
 const VAULT_CONFIG = new PublicKey('rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g');

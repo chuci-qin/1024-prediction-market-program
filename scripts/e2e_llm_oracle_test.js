@@ -28,7 +28,7 @@ const axios = require('axios');
 
 const CONFIG = {
   // 1024Chain Testnet
-  RPC_URL: process.env.RPC_URL || 'https://testnet-rpc.1024chain.com/rpc/',
+  RPC_URL: process.env.RPC_URL || 'https://rpc-testnet.1024chain.com/rpc/',
   
   // Program IDs
   PREDICTION_MARKET_PROGRAM: config.PROGRAM_ID,
