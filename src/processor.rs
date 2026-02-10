@@ -151,16 +151,50 @@ pub fn process_instruction(
         }
         
         // === Admin Operations ===
-        PredictionMarketInstruction::UpdateAdmin(_) => {
-            msg!("⚠️ UpdateAdmin: Use deployed V7 program");
-            Err(ProgramError::InvalidInstructionData)
+        PredictionMarketInstruction::UpdateAdmin(args) => {
+            msg!("Instruction: UpdateAdmin");
+            let account_info_iter = &mut accounts.iter();
+            let admin_info = next_account_info(account_info_iter)?;
+            let config_info = next_account_info(account_info_iter)?;
+            
+            if !admin_info.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            
+            let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+            if config.admin != *admin_info.key {
+                msg!("Error: Only current admin can update admin");
+                return Err(PredictionMarketError::Unauthorized.into());
+            }
+            
+            config.admin = args.new_admin;
+            config.serialize(&mut *config_info.data.borrow_mut())?;
+            msg!("✅ Admin updated to: {}", args.new_admin);
+            Ok(())
         }
-        PredictionMarketInstruction::UpdateOracleAdmin(_) => {
-            msg!("⚠️ UpdateOracleAdmin: Use deployed V7 program");
-            Err(ProgramError::InvalidInstructionData)
+        PredictionMarketInstruction::UpdateOracleAdmin(args) => {
+            msg!("Instruction: UpdateOracleAdmin");
+            let account_info_iter = &mut accounts.iter();
+            let admin_info = next_account_info(account_info_iter)?;
+            let config_info = next_account_info(account_info_iter)?;
+            
+            if !admin_info.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            
+            let mut config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+            if config.admin != *admin_info.key {
+                msg!("Error: Only admin can update oracle admin");
+                return Err(PredictionMarketError::Unauthorized.into());
+            }
+            
+            config.oracle_admin = args.new_oracle_admin;
+            config.serialize(&mut *config_info.data.borrow_mut())?;
+            msg!("✅ Oracle admin updated to: {}", args.new_oracle_admin);
+            Ok(())
         }
         PredictionMarketInstruction::SetPaused(_) => {
-            msg!("⚠️ SetPaused: Use deployed V7 program");
+            msg!("⚠️ SetPaused: Not implemented in this version");
             Err(ProgramError::InvalidInstructionData)
         }
         PredictionMarketInstruction::UpdateOracleConfig(_) => {
@@ -775,6 +809,10 @@ fn process_create_market(
     )?;
     
     // Create Market Vault (USDC Token Account)
+    // IMPORTANT: The vault holds USDC, so it must be owned by the USDC mint's token program.
+    // On 1024Chain, USDC uses Token-2022. We use usdc_mint_info.owner to dynamically
+    // determine the correct token program, making this work for both Token-v1 and Token-2022 mints.
+    let usdc_token_program = usdc_mint_info.owner;
     let vault_space = spl_token::state::Account::LEN;
     let vault_lamports = rent.minimum_balance(vault_space);
     let market_vault_seeds: &[&[u8]] = &[MARKET_VAULT_SEED, &market_id_bytes, &[market_vault_bump]];
@@ -785,23 +823,28 @@ fn process_create_market(
             market_vault_info.key,
             vault_lamports,
             vault_space as u64,
-            token_program_info.key,
+            usdc_token_program, // Use USDC mint's owner (Token-v1 or Token-2022)
         ),
         &[creator_info.clone(), market_vault_info.clone(), system_program_info.clone()],
         &[market_vault_seeds],
     )?;
     
     // Initialize Market Vault (owner = Market PDA)
-    invoke_signed(
-        &spl_token::instruction::initialize_account(
-            token_program_info.key,
+    // Build InitializeAccount3 instruction manually with the USDC token program
+    // (this is the same approach as token_compat but using the dynamic program ID)
+    {
+        let ix = crate::token_compat::create_initialize_account3_instruction(
+            usdc_token_program,
             market_vault_info.key,
             usdc_mint_info.key,
-            market_info.key, // owner
-        )?,
-        &[market_vault_info.clone(), usdc_mint_info.clone(), market_info.clone(), rent_info.clone()],
-        &[market_seeds],
-    )?;
+            market_info.key, // owner = Market PDA
+        )?;
+        invoke_signed(
+            &ix,
+            &[market_vault_info.clone(), usdc_mint_info.clone()],
+            &[market_seeds],
+        )?;
+    }
     
     // Initialize Market data
     let market = Market {
@@ -987,6 +1030,8 @@ fn process_create_multi_outcome_market(
     )?;
     
     // Create Market Vault (USDC Token Account)
+    // Use usdc_mint_info.owner to get the correct token program (Token-v1 or Token-2022)
+    let usdc_token_program = usdc_mint_info.owner;
     let vault_space = spl_token::state::Account::LEN;
     let vault_lamports = rent.minimum_balance(vault_space);
     let vault_seeds: &[&[u8]] = &[MARKET_VAULT_SEED, &market_id_bytes, &[market_vault_bump]];
@@ -997,28 +1042,26 @@ fn process_create_multi_outcome_market(
             market_vault_info.key,
             vault_lamports,
             vault_space as u64,
-            token_program_info.key,
+            usdc_token_program, // Use USDC mint's owner (Token-v1 or Token-2022)
         ),
         &[creator_info.clone(), market_vault_info.clone(), system_program_info.clone()],
         &[vault_seeds],
     )?;
     
     // Initialize Market Vault (owner = Market PDA)
-    invoke_signed(
-        &spl_token::instruction::initialize_account(
-            token_program_info.key,
+    {
+        let ix = crate::token_compat::create_initialize_account3_instruction(
+            usdc_token_program,
             market_vault_info.key,
             usdc_mint_info.key,
             market_info.key, // owner = Market PDA
-        )?,
-        &[
-            market_vault_info.clone(),
-            usdc_mint_info.clone(),
-            market_info.clone(),
-            rent_info.clone(),
-        ],
-        &[vault_seeds],
-    )?;
+        )?;
+        invoke_signed(
+            &ix,
+            &[market_vault_info.clone(), usdc_mint_info.clone()],
+            &[vault_seeds],
+        )?;
+    }
     
     // Create and initialize outcome token mints
     let mint_space = spl_token::state::Mint::LEN;
@@ -3218,11 +3261,10 @@ fn process_relayer_claim_winnings_v2(
         return Err(PredictionMarketError::MarketNotFound.into());
     }
     
-    if market.status != MarketStatus::Resolved {
+    // Accept both Resolved and Cancelled markets (matches multi-outcome version)
+    if market.status != MarketStatus::Resolved && market.status != MarketStatus::Cancelled {
         return Err(PredictionMarketError::MarketNotResolved.into());
     }
-    
-    let final_result = market.final_result.ok_or(PredictionMarketError::MarketNotResolved)?;
     
     let market_id_bytes = market.market_id.to_le_bytes();
     let current_time = get_current_timestamp()?;
@@ -3248,25 +3290,37 @@ fn process_relayer_claim_winnings_v2(
     }
     
     // Calculate settlement amount based on result
-    let (winning_amount, locked_amount) = match final_result {
-        MarketResult::Yes => (position.yes_amount, position.total_cost_e6),
-        MarketResult::No => (position.no_amount, position.total_cost_e6),
-        MarketResult::Invalid => {
-            // Refund original cost
-            (0, position.total_cost_e6)
-        }
-    };
-    
-    let settlement_amount = if final_result == MarketResult::Invalid {
-        // Full refund on invalid market
-        locked_amount
+    // For Cancelled markets: full refund of locked amount
+    let (winning_amount, locked_amount, settlement_amount) = if market.status == MarketStatus::Cancelled {
+        // Cancelled: full refund of total cost
+        (0u64, position.total_cost_e6, position.total_cost_e6)
     } else {
-        // Winning tokens pay out 1:1
-        winning_amount
+        let final_result = market.final_result.ok_or(PredictionMarketError::MarketNotResolved)?;
+        
+        let (win_amt, lock_amt) = match final_result {
+            MarketResult::Yes => (position.yes_amount, position.total_cost_e6),
+            MarketResult::No => (position.no_amount, position.total_cost_e6),
+            MarketResult::Invalid => {
+                // Refund original cost
+                (0, position.total_cost_e6)
+            }
+        };
+        
+        let settle_amt = if final_result == MarketResult::Invalid {
+            lock_amt // Full refund on invalid
+        } else {
+            win_amt  // Winning tokens pay out 1:1
+        };
+        
+        (win_amt, lock_amt, settle_amt)
     };
     
-    if settlement_amount == 0 && winning_amount == 0 {
-        msg!("No winnings to claim for user {}", args.user_wallet);
+    // Allow zero settlement for losing positions — the Vault CPI needs to release
+    // the locked amount even when settlement is $0. Without this, losers' pm_locked
+    // is permanently phantom-locked in the Vault.
+    // (Matches multi-outcome ClaimWinningsV2 which checks locked_amount, not winning_amount)
+    if settlement_amount == 0 && locked_amount == 0 {
+        msg!("No position to settle for user {}", args.user_wallet);
         return Err(PredictionMarketError::InvalidAmount.into());
     }
     
@@ -3348,7 +3402,7 @@ fn process_relayer_claim_winnings_v2(
     
     msg!("✅ RelayerClaimWinningsV2 completed");
     msg!("User: {}", args.user_wallet);
-    msg!("Result: {:?}", final_result);
+    msg!("Market status: {:?}", market.status);
     msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
     
     Ok(())
@@ -5720,8 +5774,14 @@ fn process_propose_result_with_research(
     // Account 5: MarketOracleData (for config hash verification)
     let oracle_data_info = next_account_info(account_info_iter)?;
     
-    // Account 6+: Vault accounts for bond (skipped for now)
-    let _vault_accounts = account_info_iter;
+    // Account 6: Proposer Vault Account (for bond — future use)
+    let _proposer_vault_info = next_account_info(account_info_iter)?;
+    // Account 7: Vault Config (for bond — future use)
+    let _vault_config_info = next_account_info(account_info_iter)?;
+    // Account 8: Vault Program (for bond — future use)
+    let _vault_program_info = next_account_info(account_info_iter)?;
+    // Account 9: System Program (for create_account)
+    let system_program_info = next_account_info(account_info_iter)?;
     
     // Load and validate config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -5745,16 +5805,24 @@ fn process_propose_result_with_research(
         return Err(PredictionMarketError::MarketNotFound.into());
     }
     
-    // Task 4.6.10: Verify oracle config hash matches frozen config
-    let oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
-    if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
-        return Err(PredictionMarketError::InvalidAccountData.into());
-    }
-    
-    if !oracle_data.verify_config_hash(&args.oracle_config_hash) {
-        msg!("Oracle config hash mismatch");
-        return Err(PredictionMarketError::InvalidAccountData.into());
-    }
+    // Task 4.6.10: Verify oracle config hash + get dynamic challenge duration
+    // MarketOracleData may not exist if the on-chain freeze sync failed during activation.
+    let dynamic_challenge_duration: Option<u32> = if oracle_data_info.data_len() > 0 {
+        let oracle_data = deserialize_account::<MarketOracleData>(&oracle_data_info.data.borrow())?;
+        if oracle_data.discriminator != MARKET_ORACLE_DATA_DISCRIMINATOR {
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        
+        if !oracle_data.verify_config_hash(&args.oracle_config_hash) {
+            msg!("Oracle config hash mismatch");
+            return Err(PredictionMarketError::InvalidAccountData.into());
+        }
+        msg!("Oracle config hash verified, challenge_duration={}s", oracle_data.challenge_duration_secs);
+        Some(oracle_data.challenge_duration_secs)
+    } else {
+        msg!("⚠️ MarketOracleData not found — using market duration for challenge period");
+        None
+    };
     
     // Market must be TradingHalted or AwaitingResult
     if !matches!(market.status, MarketStatus::TradingHalted | MarketStatus::AwaitingResult) {
@@ -5764,9 +5832,10 @@ fn process_propose_result_with_research(
     
     let current_time = get_current_timestamp()?;
     let market_id_bytes = args.market_id.to_le_bytes();
+    let rent = Rent::get()?;
     
-    // Create OracleProposal account (simplified - actual implementation would handle PDA creation)
-    let (proposal_pda, _proposal_bump) = Pubkey::find_program_address(
+    // ── Create OracleProposal PDA ──
+    let (proposal_pda, proposal_bump) = Pubkey::find_program_address(
         &[ORACLE_PROPOSAL_SEED, &market_id_bytes],
         program_id,
     );
@@ -5775,7 +5844,63 @@ fn process_propose_result_with_research(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    // Create OracleProposalData account (simplified)
+    // Only create if account doesn't exist yet (allows re-propose after dispute reset)
+    if proposal_info.data_len() == 0 {
+        let proposal_space = OracleProposal::SIZE;
+        let proposal_lamports = rent.minimum_balance(proposal_space);
+        let proposal_seeds: &[&[u8]] = &[ORACLE_PROPOSAL_SEED, &market_id_bytes, &[proposal_bump]];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                oracle_admin_info.key,
+                proposal_info.key,
+                proposal_lamports,
+                proposal_space as u64,
+                program_id,
+            ),
+            &[oracle_admin_info.clone(), proposal_info.clone(), system_program_info.clone()],
+            &[proposal_seeds],
+        )?;
+        msg!("Created OracleProposal PDA: {}", proposal_pda);
+    }
+    
+    // Initialize OracleProposal with full fields
+    let proposed_result = match args.outcome_index {
+        0 => MarketResult::Yes,
+        1 => MarketResult::No,
+        _ => MarketResult::Invalid,
+    };
+    
+    // Challenge deadline: use per-market dynamic duration if available,
+    // otherwise calculate from market lifetime: min(max(market_duration, 300), 86400)
+    let challenge_duration_secs = dynamic_challenge_duration.unwrap_or_else(|| {
+        // Fallback: calculate from market creation time to resolution time
+        let market_duration = (market.resolution_time - market.created_at).max(300);
+        market_duration.min(86400) as u32
+    });
+    let challenge_deadline = current_time + (challenge_duration_secs as i64);
+    msg!("Challenge deadline: {} ({}s from now)", challenge_deadline, challenge_duration_secs);
+    
+    let proposal = OracleProposal {
+        discriminator: ORACLE_PROPOSAL_DISCRIMINATOR,
+        market_id: args.market_id,
+        proposer: *oracle_admin_info.key,
+        proposed_result,
+        status: ProposalStatus::Pending,
+        proposed_at: current_time,
+        challenge_deadline,
+        bond_amount: config.proposer_bond_e6,
+        challenger: None,
+        challenger_result: None,
+        challenger_bond: 0,
+        bump: proposal_bump,
+        original_challenge_deadline: challenge_deadline,
+        challenge_count: 0,
+        reserved: [0u8; 23],
+    };
+    proposal.serialize(&mut &mut proposal_info.data.borrow_mut()[..])?;
+    
+    // ── Create OracleProposalData PDA ──
     let (proposal_data_pda, proposal_data_bump) = Pubkey::find_program_address(
         &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes],
         program_id,
@@ -5785,7 +5910,27 @@ fn process_propose_result_with_research(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    // Task 4.6.11-4.6.12: Store research data in OracleProposalData
+    // Only create if account doesn't exist yet
+    if proposal_data_info.data_len() == 0 {
+        let proposal_data_space = OracleProposalData::SIZE;
+        let proposal_data_lamports = rent.minimum_balance(proposal_data_space);
+        let proposal_data_seeds: &[&[u8]] = &[ORACLE_PROPOSAL_DATA_SEED, &market_id_bytes, &[proposal_data_bump]];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                oracle_admin_info.key,
+                proposal_data_info.key,
+                proposal_data_lamports,
+                proposal_data_space as u64,
+                program_id,
+            ),
+            &[oracle_admin_info.clone(), proposal_data_info.clone(), system_program_info.clone()],
+            &[proposal_data_seeds],
+        )?;
+        msg!("Created OracleProposalData PDA: {}", proposal_data_pda);
+    }
+    
+    // Store research data in OracleProposalData
     let proposal_data = OracleProposalData::new_llm(
         args.market_id,
         args.research_data_cid,
@@ -5802,6 +5947,9 @@ fn process_propose_result_with_research(
     market.status = MarketStatus::ResultProposed;
     market.updated_at = current_time;
     market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    msg!("OracleProposal: proposer={}, result={:?}, challenge_deadline={}, bond={}",
+         oracle_admin_info.key, proposed_result, challenge_deadline, config.proposer_bond_e6);
     
     msg!("✅ Proposed result for market {}: outcome={}, confidence={}", 
          args.market_id, args.outcome_index, args.confidence_score);
@@ -6033,10 +6181,9 @@ fn process_challenge_result_with_evidence(
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
     
-    // Task 4.6.18: Verify within challenge window
-    let challenge_deadline = proposal.proposed_at + config.challenge_window_secs;
-    if current_time > challenge_deadline {
-        msg!("Challenge window has expired: current={}, deadline={}", current_time, challenge_deadline);
+    // Verify within challenge window — use stored challenge_deadline (consistent with FinalizeResultV2)
+    if current_time > proposal.challenge_deadline {
+        msg!("Challenge window has expired: current={}, deadline={}", current_time, proposal.challenge_deadline);
         return Err(PredictionMarketError::ChallengeWindowExpired.into());
     }
     
@@ -6056,25 +6203,44 @@ fn process_challenge_result_with_evidence(
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
     
-    // Task 4.6.19: Challenger's outcome must differ from proposed outcome
+    // Challenger's outcome must differ from proposed outcome
     if args.challenger_outcome_index == proposal_data.proposed_outcome_index {
         msg!("Challenger outcome must differ from proposed outcome");
         return Err(PredictionMarketError::InvalidOutcome.into());
     }
     
-    // Task 4.6.20: Record challenger's outcome and evidence hash
+    // Record challenger's outcome and evidence hash
     proposal_data.set_challenger(args.challenger_outcome_index, current_time);
+    
+    // Record challenger info on the OracleProposal itself (for dispute resolution)
+    let mut proposal = proposal; // make mutable
+    let challenger_result = match args.challenger_outcome_index {
+        0 => MarketResult::Yes,
+        1 => MarketResult::No,
+        _ => MarketResult::Invalid,
+    };
+    proposal.challenger = Some(*challenger_info.key);
+    proposal.challenger_result = Some(challenger_result);
+    // Note: Bond amount not set here — CPI to Vault not available in this instruction variant.
+    // Use RelayerChallengeResultV2 (Index 72) for proper bond locking.
+    
+    // Extend challenge deadline on-chain (consistent with DB-side extension)
+    let challenge_duration = config.challenge_window_secs.max(3600) as i64;
+    let new_deadline = (current_time + challenge_duration).max(proposal.challenge_deadline);
+    proposal.challenge_deadline = new_deadline;
+    proposal.challenge_count = proposal.challenge_count.saturating_add(1);
     
     // Update market status to Challenged
     market.status = MarketStatus::Challenged;
     market.updated_at = current_time;
     
-    // Serialize updated accounts
+    // Serialize ALL updated accounts (proposal + proposal_data + market)
+    proposal.serialize(&mut &mut proposal_info.data.borrow_mut()[..])?;
     proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
     market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
     
-    // TODO: Transfer challenger bond from challenger's vault to market vault
-    // This requires CPI to Vault Program (skipped for now, handled by relayer)
+    msg!("Challenge recorded: challenger={}, outcome={}, new_deadline={}", 
+         challenger_info.key, args.challenger_outcome_index, new_deadline);
     
     msg!("✅ Challenge submitted for market {}: challenger={}, outcome={}, evidence_hash={:?}", 
          args.market_id,
@@ -7029,9 +7195,13 @@ fn process_finalize_result_v2(
         return Err(PredictionMarketError::MarketNotFound.into());
     }
     
-    // Market must be in ResultProposed state
-    if market.status != MarketStatus::ResultProposed {
-        msg!("❌ Market must be in ResultProposed state, got {:?}", market.status);
+    // Market must be in ResultProposed or Challenged state
+    // Challenged markets can be finalized after the extended challenge deadline passes
+    // (dispute resolution via DB resets or admin action sets status back to ResultProposed,
+    //  but we also accept Challenged directly to handle the case where dispute resolution
+    //  uses the original proposal result as the final outcome — "upheld" scenario)
+    if market.status != MarketStatus::ResultProposed && market.status != MarketStatus::Challenged {
+        msg!("❌ Market must be in ResultProposed or Challenged state, got {:?}", market.status);
         return Err(PredictionMarketError::InvalidMarketStatus.into());
     }
     
@@ -7230,10 +7400,9 @@ fn process_relayer_challenge_result_v2(
         return Err(PredictionMarketError::InvalidAccountData.into());
     }
     
-    // Verify within challenge window
-    let challenge_deadline = proposal.proposed_at + config.challenge_window_secs;
-    if current_time > challenge_deadline {
-        msg!("Challenge window has expired: current={}, deadline={}", current_time, challenge_deadline);
+    // Verify within challenge window — use stored challenge_deadline (consistent with FinalizeResultV2)
+    if current_time > proposal.challenge_deadline {
+        msg!("Challenge window has expired: current={}, deadline={}", current_time, proposal.challenge_deadline);
         return Err(PredictionMarketError::ChallengeWindowExpired.into());
     }
     
@@ -7278,7 +7447,6 @@ fn process_relayer_challenge_result_v2(
     let system_program_info = next_account_info(account_info_iter)?;
     
     // Lock challenger's bond via Vault CPI
-    // Use the same bond amount as the proposer
     let bond_amount = config.proposer_bond_e6;
     
     if bond_amount > 0 {
@@ -7289,14 +7457,13 @@ fn process_relayer_challenge_result_v2(
             &[config_bump],
         ];
         
-        // Lock the bond from challenger's vault
         cpi_lock_for_prediction(
             vault_program_info,
             vault_config_info,
             challenger_vault_info,
             challenger_pm_account_info,
             config_info,
-            relayer_info,  // payer for auto-init
+            relayer_info,
             system_program_info,
             bond_amount,
             config_seeds,
@@ -7305,23 +7472,42 @@ fn process_relayer_challenge_result_v2(
     
     // Record challenger's outcome and evidence hash
     proposal_data.set_challenger(args.challenger_outcome_index, current_time);
-    
-    // Store evidence hash (stored in proposal_data for reference)
-    // Note: evidence_hash is stored off-chain, we just log it here
     msg!("Challenge evidence_hash: {:?}", &args.evidence_hash[0..8]);
+    
+    // Record challenger info on OracleProposal (for dispute resolution tracking)
+    let mut proposal = proposal; // make mutable
+    let challenger_pubkey = Pubkey::from(args.user_wallet);
+    let challenger_result = match args.challenger_outcome_index {
+        0 => MarketResult::Yes,
+        1 => MarketResult::No,
+        _ => MarketResult::Invalid,
+    };
+    proposal.challenger = Some(challenger_pubkey);
+    proposal.challenger_result = Some(challenger_result);
+    proposal.challenger_bond = bond_amount;
+    
+    // Extend challenge deadline on-chain
+    let challenge_duration = config.challenge_window_secs.max(3600) as i64;
+    let new_deadline = (current_time + challenge_duration).max(proposal.challenge_deadline);
+    proposal.challenge_deadline = new_deadline;
+    proposal.challenge_count = proposal.challenge_count.saturating_add(1);
     
     // Update market status to Challenged
     market.status = MarketStatus::Challenged;
     market.updated_at = current_time;
     
-    // Serialize updated accounts
+    // Serialize ALL updated accounts (proposal + proposal_data + market)
+    proposal.serialize(&mut &mut proposal_info.data.borrow_mut()[..])?;
     proposal_data.serialize(&mut &mut proposal_data_info.data.borrow_mut()[..])?;
     market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
     
     msg!("✅ RelayerChallengeResultV2 completed");
-    msg!("Market {} challenged by {} (via relayer), outcome={}", 
-         args.market_id, args.user_wallet, args.challenger_outcome_index);
-    msg!("Bond locked: {} e6", bond_amount);
+    msg!("Market {} challenged by {} (via relayer), outcome={}, bond={} e6, new_deadline={}", 
+         args.market_id, args.user_wallet, args.challenger_outcome_index, bond_amount, new_deadline);
+    
+    // Structured log for chain sync service to detect challenge events
+    msg!("result_challenged:{},{},{},{}", 
+         args.market_id, args.user_wallet, args.challenger_outcome_index, bond_amount);
     
     Ok(())
 }

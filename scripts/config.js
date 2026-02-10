@@ -29,7 +29,7 @@ const COMMITMENT = 'confirmed';
 // ============================================================================
 
 const PROGRAM_ID = new PublicKey(
-    process.env.PM_PROGRAM_ID || '9hsG1DksmgadjjJTEEX7CdevQKYVkQag3mEratPRZXjv'
+    process.env.PM_PROGRAM_ID || 'ASK1FwrUkTmH6koJgrJ1zXimj1FipqvxTqEGVGM6PeRf'
 );
 
 const VAULT_PROGRAM = new PublicKey(

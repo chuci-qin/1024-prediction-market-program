@@ -45,7 +45,7 @@ async function main() {
   console.log('='.repeat(60));
   console.log('  1024 Prediction Market - Setup Test Data');
   console.log('='.repeat(60));
-  console.log(`\nProgram ID: 9hsG1DksmgadjjJTEEX7CdevQKYVkQag3mEratPRZXjv`);
+  console.log(`\nProgram ID: ASK1FwrUkTmH6koJgrJ1zXimj1FipqvxTqEGVGM6PeRf`);
   console.log(`Date: ${new Date().toISOString()}`);
   console.log('');
 

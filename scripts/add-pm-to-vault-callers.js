@@ -42,7 +42,7 @@ if (fs.existsSync(envPath)) {
 
 const VAULT_PROGRAM_ID = new PublicKey(process.env.VAULT_PROGRAM_ID || 'vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
 const VAULT_CONFIG_PDA = new PublicKey(process.env.VAULT_CONFIG_PDA || 'rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g');
-const PM_PROGRAM_ID = new PublicKey(process.env.PM_PROGRAM_ID || '9hsG1DksmgadjjJTEEX7CdevQKYVkQag3mEratPRZXjv');
+const PM_PROGRAM_ID = new PublicKey(process.env.PM_PROGRAM_ID || 'ASK1FwrUkTmH6koJgrJ1zXimj1FipqvxTqEGVGM6PeRf');
 // PM Config PDA - this is what actually makes CPI calls to Vault
 const [PM_CONFIG_PDA] = PublicKey.findProgramAddressSync([Buffer.from('pm_config')], PM_PROGRAM_ID);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://rpc-testnet.1024chain.com/rpc/';
