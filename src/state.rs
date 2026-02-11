@@ -832,8 +832,14 @@ pub struct MultiOutcomePosition {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use (reduced due to locked array)
-    pub reserved: [u8; 32],
+    /// Amount of total_cost_e6 already consumed from pm_locked during
+    /// MatchMintMulti / ExecuteTrade settlement. ClaimWinnings uses
+    /// `remaining_locked = total_cost_e6 - settled_cost_e6`.
+    /// Invariant: settled_cost_e6 <= total_cost_e6
+    pub settled_cost_e6: u64,
+    
+    /// Reserved for future use (reduced from 32 to 24 for settled_cost_e6)
+    pub reserved: [u8; 24],
 }
 
 impl MultiOutcomePosition {
@@ -853,14 +859,14 @@ impl MultiOutcomePosition {
         + 1   // bump
         + 32; // reserved = 637 bytes
     
-    /// Current size (with locked array)
-    /// holdings: 32 * 8 = 256, locked: 32 * 8 = 256, avg_costs: 32 * 8 = 256
+    /// Current size (with locked array + settled_cost_e6, carved from reserved)
+    /// holdings: 32*8=256, locked: 32*8=256, avg_costs: 32*8=256
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 1   // num_outcomes
         + 32  // owner
         + (MAX_OUTCOMES * 8)  // holdings (256 bytes)
-        + (MAX_OUTCOMES * 8)  // locked (256 bytes) - NEW
+        + (MAX_OUTCOMES * 8)  // locked (256 bytes)
         + (MAX_OUTCOMES * 8)  // avg_costs (256 bytes)
         + 8   // realized_pnl
         + 8   // total_cost_e6
@@ -869,7 +875,8 @@ impl MultiOutcomePosition {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 32; // reserved = 893 bytes
+        + 8   // settled_cost_e6
+        + 24; // reserved = 893 bytes (unchanged)
     
     /// Create a new empty multi-outcome position
     pub fn new(market_id: u64, num_outcomes: u8, owner: Pubkey, bump: u8, created_at: i64) -> Self {
@@ -888,7 +895,8 @@ impl MultiOutcomePosition {
             created_at,
             updated_at: created_at,
             bump,
-            reserved: [0u8; 32],
+            settled_cost_e6: 0,
+            reserved: [0u8; 24],
         }
     }
     
@@ -1261,13 +1269,20 @@ pub struct Position {
     /// PDA bump
     pub bump: u8,
     
-    /// Reserved for future use (reduced from 32 to 16 for locked fields)
-    pub reserved: [u8; 16],
+    /// Amount of total_cost_e6 already consumed from pm_locked during
+    /// ExecuteTrade / MatchMint settlement. ClaimWinnings uses
+    /// `remaining_locked = total_cost_e6 - settled_cost_e6` to avoid
+    /// double-releasing pm_locked.
+    /// Invariant: settled_cost_e6 <= total_cost_e6
+    pub settled_cost_e6: u64,
+    
+    /// Reserved for future use (reduced from 16 to 8 for settled_cost_e6)
+    pub reserved: [u8; 8],
 }
 
 impl Position {
-    /// Account size: 154 bytes
-    /// 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 16 = 154
+    /// Account size: 154 bytes (unchanged — settled_cost_e6 carved from reserved)
+    /// 8+8+32+8+8+8+8+8+8+8+8+1+8+8+8+1+8+8 = 154
     pub const SIZE: usize = 8   // discriminator
         + 8   // market_id
         + 32  // owner
@@ -1284,7 +1299,8 @@ impl Position {
         + 8   // created_at
         + 8   // updated_at
         + 1   // bump
-        + 16; // reserved
+        + 8   // settled_cost_e6
+        + 8;  // reserved
     
     /// PDA seeds
     pub fn seeds(market_id: u64, owner: &Pubkey) -> Vec<Vec<u8>> {
@@ -1314,7 +1330,8 @@ impl Position {
             created_at,
             updated_at: created_at,
             bump,
-            reserved: [0u8; 16],
+            settled_cost_e6: 0,
+            reserved: [0u8; 8],
         }
     }
     

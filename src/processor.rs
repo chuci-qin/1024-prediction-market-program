@@ -2555,9 +2555,12 @@ fn process_relayer_redeem_complete_set_v2(
         config_seeds,
     )?;
     
-    // Step 2: Update Position - reduce YES and NO amounts
+    // Step 2: Update Position - reduce YES and NO amounts + total_cost
     position.yes_amount = position.yes_amount.saturating_sub(args.amount);
     position.no_amount = position.no_amount.saturating_sub(args.amount);
+    // Reduce total_cost to match reduced position (Bug #5 fix).
+    // Redeem returns 1:1 USDC, so cost reduction = args.amount.
+    position.total_cost_e6 = position.total_cost_e6.saturating_sub(args.amount);
     position.updated_at = current_time;
     
     position.serialize(&mut *position_info.data.borrow_mut())?;
@@ -2716,31 +2719,29 @@ fn process_match_mint_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // Step 1: Lock funds for YES buyer
-    msg!("CPI: Lock {} for YES buyer", yes_cost);
-    cpi_lock_for_prediction(
+    // Step 1: Settle YES buyer — consume PlaceOrder's locked margin (NOT Lock!)
+    // PlaceOrder already locked the margin via cpi_lock. MatchMint consumes it
+    // via Settle to avoid double-locking. settled_cost_e6 is updated in Step 3.
+    msg!("CPI: Settle YES buyer - consume {} from PlaceOrder margin", yes_cost);
+    cpi_prediction_settle(
         vault_program_info,
         vault_config_info,
-        yes_vault_info,
         yes_pm_user_info,
         config_info,
-        relayer_info,       // Payer for auto-init
-        system_program_info, // System program for auto-init
-        yes_cost,
+        yes_cost,           // locked_amount: consume from pm_locked
+        0,                  // settlement_amount: buyer gets no pending (shares instead)
         config_seeds,
     )?;
     
-    // Step 2: Lock funds for NO buyer
-    msg!("CPI: Lock {} for NO buyer", no_cost);
-    cpi_lock_for_prediction(
+    // Step 2: Settle NO buyer — consume PlaceOrder's locked margin
+    msg!("CPI: Settle NO buyer - consume {} from PlaceOrder margin", no_cost);
+    cpi_prediction_settle(
         vault_program_info,
         vault_config_info,
-        no_vault_info,
         no_pm_user_info,
         config_info,
-        relayer_info,       // Payer for auto-init
-        system_program_info, // System program for auto-init
-        no_cost,
+        no_cost,            // locked_amount: consume from pm_locked
+        0,                  // settlement_amount: buyer gets no pending
         config_seeds,
     )?;
     
@@ -2798,6 +2799,8 @@ fn process_match_mint_v2(
             pos
         };
         yes_position.add_tokens(Outcome::Yes, match_amount, args.yes_price, current_time);
+        // Track that this cost was already settled from pm_locked (Step 1 CPI)
+        yes_position.settled_cost_e6 = yes_position.settled_cost_e6.saturating_add(yes_cost);
         yes_position.serialize(&mut yes_position_data.as_mut())?;
     }
     
@@ -2854,6 +2857,8 @@ fn process_match_mint_v2(
             pos
         };
         no_position.add_tokens(Outcome::No, match_amount, args.no_price, current_time);
+        // Track that this cost was already settled from pm_locked (Step 2 CPI)
+        no_position.settled_cost_e6 = no_position.settled_cost_e6.saturating_add(no_cost);
         no_position.serialize(&mut no_position_data.as_mut())?;
     }
     
@@ -3289,30 +3294,34 @@ fn process_relayer_claim_winnings_v2(
         return Err(PredictionMarketError::AlreadySettled.into());
     }
     
-    // Calculate settlement amount based on result
-    // For Cancelled markets: full refund of locked amount
+    // Calculate settlement amount based on result.
+    // CRITICAL: Use remaining_locked (= total_cost - settled_cost) instead of total_cost.
+    // settled_cost_e6 tracks how much pm_locked was already consumed during
+    // ExecuteTrade or MatchMint. Without this subtraction, ClaimWinnings would
+    // try to release pm_locked that was already consumed → "Insufficient" error.
+    let remaining_locked = position.total_cost_e6.saturating_sub(position.settled_cost_e6);
+    
     let (winning_amount, locked_amount, settlement_amount) = if market.status == MarketStatus::Cancelled {
-        // Cancelled: full refund of total cost
-        (0u64, position.total_cost_e6, position.total_cost_e6)
+        // Cancelled: refund only the remaining locked portion.
+        // Funds already consumed via ExecuteTrade were paid to the counterparty
+        // and cannot be refunded (correct economic behavior).
+        (0u64, remaining_locked, remaining_locked)
     } else {
         let final_result = market.final_result.ok_or(PredictionMarketError::MarketNotResolved)?;
         
-        let (win_amt, lock_amt) = match final_result {
-            MarketResult::Yes => (position.yes_amount, position.total_cost_e6),
-            MarketResult::No => (position.no_amount, position.total_cost_e6),
-            MarketResult::Invalid => {
-                // Refund original cost
-                (0, position.total_cost_e6)
-            }
+        let win_amt = match final_result {
+            MarketResult::Yes => position.yes_amount,
+            MarketResult::No => position.no_amount,
+            MarketResult::Invalid => 0,
         };
         
         let settle_amt = if final_result == MarketResult::Invalid {
-            lock_amt // Full refund on invalid
+            remaining_locked // Refund remaining on invalid
         } else {
-            win_amt  // Winning tokens pay out 1:1
+            win_amt  // Winning tokens pay out 1:1 (1 share = $1 USDC in e6)
         };
         
-        (win_amt, lock_amt, settle_amt)
+        (win_amt, remaining_locked, settle_amt)
     };
     
     // Allow zero settlement for losing positions — the Vault CPI needs to release
@@ -3735,6 +3744,9 @@ fn process_execute_trade_v2(
     
     // Add shares to buyer
     buyer_position.add_tokens(outcome, match_amount, exec_price, current_time);
+    // Track that trade_cost was already settled from buyer's pm_locked (Step 1 CPI above).
+    // This prevents ClaimWinnings from double-releasing the same pm_locked.
+    buyer_position.settled_cost_e6 = buyer_position.settled_cost_e6.saturating_add(trade_cost);
     
     // Migrate seller Position if needed (old 146 bytes → new 154 bytes)
     if seller_position_info.data_len() < Position::SIZE {
@@ -4318,17 +4330,17 @@ fn process_match_mint_multi_v2(
             .checked_div(PRICE_PRECISION as u128)
             .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
         
-        // CPI: Lock buyer funds via Vault
-        msg!("CPI: Lock {} for outcome {} buyer", buyer_cost, expected_outcome_idx);
-        cpi_lock_for_prediction(
+        // CPI: Settle buyer — consume PlaceOrder's locked margin (NOT Lock!)
+        // PlaceOrder already locked the margin. MatchMintMulti consumes it via Settle
+        // to avoid double-locking. settled_cost_e6 is updated below.
+        msg!("CPI: Settle {} for outcome {} buyer (consume PlaceOrder margin)", buyer_cost, expected_outcome_idx);
+        cpi_prediction_settle(
             vault_program_info,
             vault_config_info,
-            user_account_info,
             pm_user_account_info,
             config_info,
-            relayer_info,
-            system_program_info,
-            buyer_cost,
+            buyer_cost,         // locked_amount: consume from pm_locked
+            0,                  // settlement_amount: buyer gets shares, not pending
             config_seeds,
         )?;
         
@@ -4355,6 +4367,8 @@ fn process_match_mint_multi_v2(
         }
         position.holdings[holding_idx] = position.holdings[holding_idx].saturating_add(match_amount);
         position.total_cost_e6 = position.total_cost_e6.saturating_add(buyer_cost);
+        // Track settled cost for ClaimWinnings (avoids double pm_locked release)
+        position.settled_cost_e6 = position.settled_cost_e6.saturating_add(buyer_cost);
         position.updated_at = current_time;
         position.serialize(&mut *position_info.data.borrow_mut())?;
         
@@ -4701,11 +4715,13 @@ fn process_relayer_place_order_v2(
     }
     
     // Calculate margin requirement (in e6 precision)
-    // margin_e6 = amount * price_e6
-    // Example: 100 contracts × 500,000 (50%) = 50,000,000 e6 = $50 USDC
-    // NOTE: Do NOT divide by PRICE_PRECISION! price is already in e6 format.
+    // margin_e6 = amount_e6 × price_e6 / PRICE_PRECISION
+    // Example: 100_000_000 (100 shares) × 500_000 (50¢) / 1_000_000 = 50_000_000 ($50)
+    // All amounts are in e6 precision (1 share = 1_000_000 units).
     let margin = (args.amount as u128)
         .checked_mul(args.price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
@@ -4919,11 +4935,13 @@ fn process_relayer_cancel_order_v2(
     let _system_program_info = next_account_info(account_info_iter)?;
     
     // Calculate remaining margin to unlock (in e6 precision)
-    // remaining_margin_e6 = remaining_amount * price_e6
-    // NOTE: Do NOT divide by PRICE_PRECISION! price is already in e6 format.
+    // remaining_margin_e6 = remaining_e6 × price_e6 / PRICE_PRECISION
+    // Must use same formula as PlaceOrder margin to ensure exact release.
     let remaining = order.remaining_amount();
     let remaining_margin = (remaining as u128)
         .checked_mul(order.price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
@@ -5216,7 +5234,8 @@ fn process_relayer_mint_complete_set_v2_with_fee(
             created_at: current_time,
             updated_at: current_time,
             bump: position_bump,
-            reserved: [0u8; 16],
+            settled_cost_e6: 0,
+            reserved: [0u8; 8],
         };
         position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
         
@@ -5397,9 +5416,10 @@ fn process_relayer_redeem_complete_set_v2_with_fee(
         return Err(PredictionMarketError::InsufficientPosition.into());
     }
     
-    // Burn virtual shares
+    // Burn virtual shares and reduce total_cost (Bug #5 fix)
     position.yes_amount = position.yes_amount.saturating_sub(args.amount);
     position.no_amount = position.no_amount.saturating_sub(args.amount);
+    position.total_cost_e6 = position.total_cost_e6.saturating_sub(args.amount);
     position.updated_at = current_time;
     position.serialize(&mut &mut position_info.data.borrow_mut()[..])?;
     
@@ -6347,8 +6367,12 @@ fn process_relayer_place_multi_outcome_order_v2(
     }
     
     // Calculate margin requirement (in e6 precision)
+    // margin_e6 = amount_e6 × price_e6 / PRICE_PRECISION
+    // All amounts are in e6 precision (1 share = 1_000_000 units).
     let margin = (args.amount as u128)
         .checked_mul(args.price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
@@ -6549,10 +6573,13 @@ fn process_relayer_cancel_multi_outcome_order_v2(
     // Account 9: System Program
     let _system_program_info = next_account_info(account_info_iter)?;
     
-    // Calculate remaining amount and margin
+    // Calculate remaining amount and margin (e6 precision)
+    // remaining_margin_e6 = remaining_e6 × price_e6 / PRICE_PRECISION
     let remaining = order.amount.saturating_sub(order.filled_amount);
     let remaining_margin = (remaining as u128)
         .checked_mul(order.price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
         .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
     
     let current_time = get_current_timestamp()?;
@@ -7063,18 +7090,21 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
         return Err(PredictionMarketError::AlreadySettled.into());
     }
     
-    // Calculate settlement
-    let locked_amount = position.total_cost_e6;
+    // Calculate settlement.
+    // CRITICAL: Use remaining_locked (total_cost - settled_cost) to avoid
+    // double-releasing pm_locked that was already consumed in trades.
+    let remaining_locked = position.total_cost_e6.saturating_sub(position.settled_cost_e6);
+    let locked_amount = remaining_locked;
     
     let settlement_amount = if market.status == MarketStatus::Cancelled {
-        // Full refund on cancelled market
+        // Cancelled: refund only remaining locked (not already traded away)
         locked_amount
     } else {
         // Get winning outcome index
         let winning_outcome_index = market.winning_outcome_index
             .ok_or(PredictionMarketError::MarketNotResolved)?;
         
-        // Winning tokens pay out 1:1
+        // Winning tokens pay out 1:1 (1 share = $1 USDC in e6)
         position.holdings[winning_outcome_index as usize]
     };
     
