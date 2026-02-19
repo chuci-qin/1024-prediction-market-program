@@ -5971,6 +5971,10 @@ fn process_propose_result_with_research(
     msg!("OracleProposal: proposer={}, result={:?}, challenge_deadline={}, bond={}",
          oracle_admin_info.key, proposed_result, challenge_deadline, config.proposer_bond_e6);
     
+    // Structured log for chain sync parsing (must match LOG_PREFIX_RESULT_PROPOSED in sync.rs)
+    msg!("result_proposed:{},{},{},{}", 
+         args.market_id, oracle_admin_info.key, args.outcome_index, config.proposer_bond_e6);
+    
     msg!("✅ Proposed result for market {}: outcome={}, confidence={}", 
          args.market_id, args.outcome_index, args.confidence_score);
     
