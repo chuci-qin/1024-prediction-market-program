@@ -36,6 +36,7 @@ use crate::cpi::{
     cpi_release_from_prediction,
     cpi_prediction_settle,
     cpi_prediction_settle_with_auto_init,
+    cpi_prediction_settle_to_available,
     cpi_lock_for_prediction_with_fee,
     cpi_release_from_prediction_with_fee,
     cpi_trade_with_fee,
@@ -419,6 +420,10 @@ pub fn process_instruction(
         PredictionMarketInstruction::ExecuteMultiOutcomeTradeV2(args) => {
             msg!("Instruction: ExecuteMultiOutcomeTradeV2");
             process_execute_multi_outcome_trade_v2(program_id, accounts, args)
+        }
+        PredictionMarketInstruction::RelayerSettlePrediction(args) => {
+            msg!("Instruction: RelayerSettlePrediction");
+            process_relayer_settle_prediction(program_id, accounts, args)
         }
     }
 }
@@ -3247,6 +3252,9 @@ fn process_relayer_claim_winnings_v2(
     
     // Account 6: Vault Program
     let vault_program_info = next_account_info(account_info_iter)?;
+
+    // Account 7 (optional): UserAccount — if present, settle directly to available_balance
+    let user_vault_info = next_account_info(account_info_iter).ok();
     
     // Load and validate config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -3324,15 +3332,6 @@ fn process_relayer_claim_winnings_v2(
         (win_amt, remaining_locked, settle_amt)
     };
     
-    // Allow zero settlement for losing positions — the Vault CPI needs to release
-    // the locked amount even when settlement is $0. Without this, losers' pm_locked
-    // is permanently phantom-locked in the Vault.
-    // (Matches multi-outcome ClaimWinningsV2 which checks locked_amount, not winning_amount)
-    if settlement_amount == 0 && locked_amount == 0 {
-        msg!("No position to settle for user {}", args.user_wallet);
-        return Err(PredictionMarketError::InvalidAmount.into());
-    }
-    
     // Derive Config PDA for CPI signing
     let (config_pda, config_bump) = Pubkey::find_program_address(
         &[PM_CONFIG_SEED],
@@ -3345,57 +3344,56 @@ fn process_relayer_claim_winnings_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // Check for optional fee accounts
-    // Account 8: Vault Token Account (optional)
-    // Account 9: PM Fee Vault (optional)
-    // Account 10: PM Fee Config (optional)
-    // Account 11: Token Program (optional)
-    let vault_token_account = next_account_info(account_info_iter).ok();
-    let pm_fee_vault = next_account_info(account_info_iter).ok();
-    let pm_fee_config = next_account_info(account_info_iter).ok();
-    let token_program = next_account_info(account_info_iter).ok();
-    
-    let use_fee_settlement = vault_token_account.is_some() 
-        && pm_fee_vault.is_some() 
-        && pm_fee_config.is_some() 
-        && token_program.is_some();
-    
-    if use_fee_settlement {
-        // Use settle with fee CPI
-        let vta = vault_token_account.unwrap();
-        let pfv = pm_fee_vault.unwrap();
-        let pfc = pm_fee_config.unwrap();
-        let tp = token_program.unwrap();
-        
-        msg!("CPI: Vault.PredictionMarketSettleWithFee locked={}, settlement={}", 
-             locked_amount, settlement_amount);
-        cpi_settle_with_fee(
-            vault_program_info,
-            vault_config_info,
-            pm_user_account_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            locked_amount,
-            settlement_amount,
-            config_seeds,
-        )?;
-        msg!("✅ Settlement with fee collection completed");
+    // Settlement CPI — only if there's something to settle
+    if locked_amount > 0 || settlement_amount > 0 {
+        if let Some(uvi) = user_vault_info {
+            // New path: settle directly to available_balance (skips pending_settlement)
+            msg!("CPI: Vault.SettleToAvailable locked={}, settlement={}", locked_amount, settlement_amount);
+            cpi_prediction_settle_to_available(
+                vault_program_info,
+                vault_config_info,
+                uvi,
+                pm_user_account_info,
+                config_info,
+                locked_amount,
+                settlement_amount,
+                config_seeds,
+            )?;
+            msg!("✅ Settlement directly to available completed");
+        } else {
+            // Backward compatible: old path via pending_settlement
+            // Check for optional fee accounts
+            let vault_token_account = next_account_info(account_info_iter).ok();
+            let pm_fee_vault = next_account_info(account_info_iter).ok();
+            let pm_fee_config = next_account_info(account_info_iter).ok();
+            let token_program = next_account_info(account_info_iter).ok();
+            
+            let use_fee_settlement = vault_token_account.is_some() 
+                && pm_fee_vault.is_some() 
+                && pm_fee_config.is_some() 
+                && token_program.is_some();
+            
+            if use_fee_settlement {
+                let vta = vault_token_account.unwrap();
+                let pfv = pm_fee_vault.unwrap();
+                let pfc = pm_fee_config.unwrap();
+                let tp = token_program.unwrap();
+                
+                msg!("CPI: Vault.SettleWithFee locked={}, settlement={} (legacy)", locked_amount, settlement_amount);
+                cpi_settle_with_fee(
+                    vault_program_info, vault_config_info, pm_user_account_info, config_info,
+                    vta, pfv, pfc, tp, locked_amount, settlement_amount, config_seeds,
+                )?;
+            } else {
+                msg!("CPI: Vault.Settle locked={}, settlement={} (legacy)", locked_amount, settlement_amount);
+                cpi_prediction_settle(
+                    vault_program_info, vault_config_info, pm_user_account_info, config_info,
+                    locked_amount, settlement_amount, config_seeds,
+                )?;
+            }
+        }
     } else {
-        // Use regular settle CPI (no fee)
-        msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
-             locked_amount, settlement_amount);
-        cpi_prediction_settle(
-            vault_program_info,
-            vault_config_info,
-            pm_user_account_info,
-            config_info,
-            locked_amount,
-            settlement_amount,
-            config_seeds,
-        )?;
+        msg!("Loser/zero position: locked=0, settlement=0, skipping CPI");
     }
     
     // Update Position
@@ -3460,8 +3458,8 @@ fn process_execute_trade_v2(
     // Account 6: Seller Position PDA (writable)
     let seller_position_info = next_account_info(account_info_iter)?;
     
-    // Account 7: Buyer UserAccount (Vault, writable) - not used in Settle, but for validation
-    let _buyer_vault_info = next_account_info(account_info_iter)?;
+    // Account 7: Buyer UserAccount (Vault, writable) - used for excess margin refund
+    let buyer_vault_info = next_account_info(account_info_iter)?;
     
     // Account 8: Buyer PMUserAccount (Vault, writable)
     let buyer_pm_user_info = next_account_info(account_info_iter)?;
@@ -3656,9 +3654,8 @@ fn process_execute_trade_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // Step 1: CPI - Settle buyer (deduct from pm_locked)
+    // Step 1a: CPI - Settle buyer (deduct trade_cost from pm_locked)
     // locked=trade_cost, settlement=0
-    // 使用支持自动创建 PMUserAccount 的版本
     msg!("CPI: Settle buyer - deduct {} from pm_locked", trade_cost);
     cpi_prediction_settle_with_auto_init(
         vault_program_info,
@@ -3672,6 +3669,35 @@ fn process_execute_trade_v2(
         0,                      // settlement_amount (none for buyer in trade)
         config_seeds,
     )?;
+    
+    // Step 1b: Release excess margin back to buyer's available_balance.
+    // PlaceOrder locked margin at order_price, but ExecuteTrade fills at exec_price.
+    // When exec_price < order_price (common for IOC/Market orders), the difference
+    // must be returned: pm_locked → available_balance.
+    let margin_at_order_price = (match_amount as u128)
+        .checked_mul(buy_order.price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
+    
+    let excess_margin = margin_at_order_price.saturating_sub(trade_cost);
+    
+    if excess_margin > 0 {
+        msg!("CPI: Release excess margin {} (order_price={}, exec_price={}, margin_at_order={}, trade_cost={})",
+             excess_margin, buy_order.price, exec_price, margin_at_order_price, trade_cost);
+        cpi_release_from_prediction(
+            vault_program_info,
+            vault_config_info,
+            buyer_vault_info,
+            buyer_pm_user_info,
+            config_info,
+            excess_margin,
+            config_seeds,
+        )?;
+    } else {
+        msg!("No excess margin: order_price={} == exec_price={}, trade_cost={}", 
+             buy_order.price, exec_price, trade_cost);
+    }
     
     // Step 2: CPI - Settle seller (add to pending_settlement)
     // locked=0, settlement=trade_cost
@@ -3907,7 +3933,7 @@ fn process_execute_multi_outcome_trade_v2(
     let sell_order_info = next_account_info(account_info_iter)?;
     let buyer_position_info = next_account_info(account_info_iter)?;
     let seller_position_info = next_account_info(account_info_iter)?;
-    let _buyer_vault_info = next_account_info(account_info_iter)?;
+    let buyer_vault_info = next_account_info(account_info_iter)?;  // Account 7: for excess margin refund
     let buyer_pm_user_info = next_account_info(account_info_iter)?;
     let _seller_vault_info = next_account_info(account_info_iter)?;
     let seller_pm_user_info = next_account_info(account_info_iter)?;
@@ -3966,8 +3992,8 @@ fn process_execute_multi_outcome_trade_v2(
         return Err(PredictionMarketError::InvalidPDA.into());
     }
     
-    // Load orders and extract what we need
-    let (buyer_owner, seller_owner, match_amount, exec_price, trade_cost) = {
+    // Load orders and extract what we need (including buy_order_price for excess margin calc)
+    let (buyer_owner, seller_owner, match_amount, exec_price, trade_cost, buy_order_price) = {
         let buy_order = deserialize_account::<Order>(&buy_order_info.data.borrow())?;
         let sell_order = deserialize_account::<Order>(&sell_order_info.data.borrow())?;
         
@@ -4002,7 +4028,7 @@ fn process_execute_multi_outcome_trade_v2(
         
         let cost = ((match_amt as u128) * (price as u128) / (PRICE_PRECISION as u128)) as u64;
         
-        (buy_order.owner, sell_order.owner, match_amt, price, cost)
+        (buy_order.owner, sell_order.owner, match_amt, price, cost, buy_order.price)
     };
     
     let current_time = get_current_timestamp()?;
@@ -4034,14 +4060,44 @@ fn process_execute_multi_outcome_trade_v2(
     }
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // CPI: Settle buyer (deduct from pm_locked)
+    // Step 1a: CPI - Settle buyer (deduct trade_cost from pm_locked)
+    msg!("CPI: MultiOutcome settle buyer - deduct {} from pm_locked", trade_cost);
     cpi_prediction_settle_with_auto_init(
         vault_program_info, vault_config_info, buyer_pm_user_info, config_info,
         relayer_info, system_program_info, buyer_wallet_info,
         trade_cost, 0, config_seeds,
     )?;
     
-    // CPI: Settle seller (add to pending_settlement)
+    // Step 1b: Release excess margin back to buyer's available_balance.
+    // PlaceOrder locked margin at buy_order_price, but ExecuteTrade fills at exec_price.
+    // When exec_price < buy_order_price (common for IOC/Market orders), the difference
+    // must be returned: pm_locked -> available_balance.
+    let margin_at_order_price = (match_amount as u128)
+        .checked_mul(buy_order_price as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)?
+        .checked_div(PRICE_PRECISION as u128)
+        .ok_or(PredictionMarketError::ArithmeticOverflow)? as u64;
+    
+    let excess_margin = margin_at_order_price.saturating_sub(trade_cost);
+    
+    if excess_margin > 0 {
+        msg!("CPI: MultiOutcome release excess margin {} (order_price={}, exec_price={}, margin_at_order={}, trade_cost={})",
+             excess_margin, buy_order_price, exec_price, margin_at_order_price, trade_cost);
+        cpi_release_from_prediction(
+            vault_program_info,
+            vault_config_info,
+            buyer_vault_info,
+            buyer_pm_user_info,
+            config_info,
+            excess_margin,
+            config_seeds,
+        )?;
+    } else {
+        msg!("MultiOutcome: No excess margin: order_price={} == exec_price={}, trade_cost={}",
+             buy_order_price, exec_price, trade_cost);
+    }
+    
+    // Step 2: CPI - Settle seller (add to pending_settlement)
     cpi_prediction_settle_with_auto_init(
         vault_program_info, vault_config_info, seller_pm_user_info, config_info,
         relayer_info, system_program_info, seller_wallet_info,
@@ -4091,11 +4147,13 @@ fn process_execute_multi_outcome_trade_v2(
             )?;
             let mut pos = MultiOutcomePosition::new(market_id, num_outcomes, buyer_owner, buyer_position_bump, current_time);
             pos.add_tokens(args.outcome_index, match_amount, exec_price, current_time);
+            pos.settled_cost_e6 = pos.settled_cost_e6.saturating_add(trade_cost);
             pos.serialize(&mut *buyer_position_info.data.borrow_mut())?;
         } else {
             let mut data = buyer_position_info.data.borrow_mut();
             let mut pos = deserialize_account::<MultiOutcomePosition>(&data)?;
             pos.add_tokens(args.outcome_index, match_amount, exec_price, current_time);
+            pos.settled_cost_e6 = pos.settled_cost_e6.saturating_add(trade_cost);
             pos.serialize(&mut &mut data[..])?;
         }
     }
@@ -7040,6 +7098,9 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
     
     // Account 6: Vault Program
     let vault_program_info = next_account_info(account_info_iter)?;
+
+    // Account 7 (optional): UserAccount — if present, settle directly to available_balance
+    let user_vault_info = next_account_info(account_info_iter).ok();
     
     // Load and validate config
     let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
@@ -7112,11 +7173,6 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
         position.holdings[winning_outcome_index as usize]
     };
     
-    if settlement_amount == 0 && locked_amount == 0 {
-        msg!("No position to claim for user {}", args.user_wallet);
-        return Err(PredictionMarketError::InvalidAmount.into());
-    }
-    
     // Derive Config PDA for CPI signing
     let (config_pda, config_bump) = Pubkey::find_program_address(
         &[PM_CONFIG_SEED],
@@ -7129,20 +7185,37 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
     
     let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
     
-    // Step 1: Vault CPI - Settle
-    msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}", 
-         locked_amount, settlement_amount);
-    cpi_prediction_settle(
-        vault_program_info,
-        vault_config_info,
-        pm_user_account_info,
-        config_info,
-        locked_amount,
-        settlement_amount,
-        config_seeds,
-    )?;
+    // Vault CPI — only if there's something to settle
+    if locked_amount > 0 || settlement_amount > 0 {
+        if let Some(uvi) = user_vault_info {
+            msg!("CPI: Vault.SettleToAvailable locked={}, settlement={} (multi-outcome)", locked_amount, settlement_amount);
+            cpi_prediction_settle_to_available(
+                vault_program_info,
+                vault_config_info,
+                uvi,
+                pm_user_account_info,
+                config_info,
+                locked_amount,
+                settlement_amount,
+                config_seeds,
+            )?;
+        } else {
+            msg!("CPI: Vault.Settle locked={}, settlement={} (multi-outcome, legacy)", locked_amount, settlement_amount);
+            cpi_prediction_settle(
+                vault_program_info,
+                vault_config_info,
+                pm_user_account_info,
+                config_info,
+                locked_amount,
+                settlement_amount,
+                config_seeds,
+            )?;
+        }
+    } else {
+        msg!("Multi-outcome: loser/zero position, locked=0, settlement=0, skipping CPI");
+    }
     
-    // Step 2: Update position
+    // Update position
     let pnl = (settlement_amount as i64) - (locked_amount as i64);
     position.realized_pnl = position.realized_pnl.saturating_add(pnl);
     position.settlement_amount = settlement_amount;
@@ -7615,5 +7688,81 @@ fn process_remove_authorized_caller(
     msg!("✅ RemoveAuthorizedCaller: {}", args.caller);
     msg!("Note: Authorized callers are managed via config.authorized_caller or AuthorizedCallers PDA");
     
+    Ok(())
+}
+
+// ============================================================================
+// Pure Ledger Settle (no Position PDA)
+// ============================================================================
+
+fn process_relayer_settle_prediction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RelayerSettlePredictionArgs,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+
+    let relayer_info = next_account_info(account_info_iter)?;
+    check_signer(relayer_info)?;
+
+    let config_info = next_account_info(account_info_iter)?;
+    let market_info = next_account_info(account_info_iter)?;
+    let pm_user_account_info = next_account_info(account_info_iter)?;
+    let vault_config_info = next_account_info(account_info_iter)?;
+    let vault_program_info = next_account_info(account_info_iter)?;
+
+    let config = deserialize_account::<PredictionMarketConfig>(&config_info.data.borrow())?;
+    if config.discriminator != PM_CONFIG_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+
+    verify_relayer(&config, relayer_info.key)?;
+
+    let market = deserialize_account::<Market>(&market_info.data.borrow())?;
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(PredictionMarketError::InvalidAccountData.into());
+    }
+
+    if market.market_id != args.market_id {
+        return Err(PredictionMarketError::MarketNotFound.into());
+    }
+
+    if market.status != MarketStatus::Resolved && market.status != MarketStatus::Cancelled {
+        msg!("Market must be Resolved or Cancelled, got {:?}", market.status);
+        return Err(PredictionMarketError::MarketNotResolved.into());
+    }
+
+    if args.locked_amount == 0 && args.settlement_amount == 0 {
+        msg!("Nothing to settle (locked=0, settlement=0)");
+        return Ok(());
+    }
+
+    let (config_pda, config_bump) = Pubkey::find_program_address(
+        &[PM_CONFIG_SEED],
+        program_id,
+    );
+
+    if *config_info.key != config_pda {
+        return Err(PredictionMarketError::InvalidPDA.into());
+    }
+
+    let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
+
+    msg!("CPI: Vault.PredictionMarketSettle locked={}, settlement={}",
+         args.locked_amount, args.settlement_amount);
+    cpi_prediction_settle(
+        vault_program_info,
+        vault_config_info,
+        pm_user_account_info,
+        config_info,
+        args.locked_amount,
+        args.settlement_amount,
+        config_seeds,
+    )?;
+
+    msg!("✅ RelayerSettlePrediction completed");
+    msg!("User: {}, Market: {}, Locked: {}, Settlement: {}",
+         args.user_wallet, args.market_id, args.locked_amount, args.settlement_amount);
+
     Ok(())
 }

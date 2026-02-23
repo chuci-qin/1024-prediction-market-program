@@ -1016,6 +1016,18 @@ pub enum PredictionMarketInstruction {
     /// 14. `[]` Buyer Wallet
     /// 15. `[]` Seller Wallet
     ExecuteMultiOutcomeTradeV2(ExecuteMultiOutcomeTradeV2Args),
+
+    /// Pure Ledger Settle: Backend-calculated settlement via Vault CPI.
+    /// No Position PDA required — amounts come from the backend (DB-calculated).
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Relayer
+    /// 1. `[]` PredictionMarketConfig
+    /// 2. `[]` Market PDA (validates Resolved/Cancelled status)
+    /// 3. `[writable]` PMUserAccount (Vault PDA for user)
+    /// 4. `[]` VaultConfig
+    /// 5. `[]` Vault Program
+    RelayerSettlePrediction(RelayerSettlePredictionArgs),
 }
 
 // ============================================================================
@@ -1804,6 +1816,17 @@ pub struct ExecuteMultiOutcomeTradeV2Args {
     pub amount: u64,
     /// Execution price (e6)
     pub price: u64,
+}
+
+/// Pure Ledger Settle: backend provides pre-calculated locked/settlement amounts
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RelayerSettlePredictionArgs {
+    pub user_wallet: Pubkey,
+    pub market_id: u64,
+    /// Amount to release from pm_locked (may be 0 for trade-acquired positions)
+    pub locked_amount: u64,
+    /// Amount to credit to pending_settlement (0 for losers, shares for winners)
+    pub settlement_amount: u64,
 }
 
 // ============================================================================
