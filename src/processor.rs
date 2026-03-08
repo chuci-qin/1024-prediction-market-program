@@ -37,6 +37,7 @@ use crate::cpi::{
     cpi_prediction_settle,
     cpi_prediction_settle_with_auto_init,
     cpi_prediction_settle_to_available,
+    cpi_settle_to_available_with_fee,
     cpi_lock_for_prediction_with_fee,
     cpi_release_from_prediction_with_fee,
     cpi_trade_with_fee,
@@ -3361,19 +3362,39 @@ fn process_relayer_claim_winnings_v2(
     // Settlement CPI — only if there's something to settle
     if locked_amount > 0 || settlement_amount > 0 {
         if let Some(uvi) = user_vault_info {
-            // New path: settle directly to available_balance (skips pending_settlement)
-            msg!("CPI: Vault.SettleToAvailable locked={}, settlement={}", locked_amount, settlement_amount);
-            cpi_prediction_settle_to_available(
-                vault_program_info,
-                vault_config_info,
-                uvi,
-                pm_user_account_info,
-                config_info,
-                locked_amount,
-                settlement_amount,
-                config_seeds,
-            )?;
-            msg!("✅ Settlement directly to available completed");
+            // Check if PMFeeConfig follows (index 8) for fee-enabled settlement
+            let pm_fee_config_opt = next_account_info(account_info_iter).ok();
+
+            if let Some(pm_fee_config) = pm_fee_config_opt {
+                // SettleToAvailableWithFee: one-step settlement with fee deduction
+                msg!("CPI: Vault.SettleToAvailableWithFee locked={}, settlement={}", locked_amount, settlement_amount);
+                cpi_settle_to_available_with_fee(
+                    vault_program_info,
+                    vault_config_info,
+                    uvi,
+                    pm_user_account_info,
+                    config_info,
+                    pm_fee_config,
+                    locked_amount,
+                    settlement_amount,
+                    config_seeds,
+                )?;
+                msg!("✅ Settlement to available with fee completed");
+            } else {
+                // SettleToAvailable: no fee, full settlement
+                msg!("CPI: Vault.SettleToAvailable locked={}, settlement={}", locked_amount, settlement_amount);
+                cpi_prediction_settle_to_available(
+                    vault_program_info,
+                    vault_config_info,
+                    uvi,
+                    pm_user_account_info,
+                    config_info,
+                    locked_amount,
+                    settlement_amount,
+                    config_seeds,
+                )?;
+                msg!("✅ Settlement directly to available completed");
+            }
         } else {
             // Backward compatible: old path via pending_settlement
             // Check for optional fee accounts

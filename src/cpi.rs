@@ -210,6 +210,52 @@ pub fn cpi_prediction_settle_to_available<'a>(
     Ok(())
 }
 
+/// SettleToAvailableWithFee — one-step settlement with fee deduction (CPI to Vault Program)
+///
+/// Vault instruction index: 49 (PredictionMarketSettleToAvailableWithFee)
+/// Accounts: vault_config, user_account, pm_user_account, caller_program, pm_fee_config
+pub fn cpi_settle_to_available_with_fee<'a>(
+    vault_program: &AccountInfo<'a>,
+    vault_config: &AccountInfo<'a>,
+    user_account: &AccountInfo<'a>,
+    pm_user_account: &AccountInfo<'a>,
+    caller_program: &AccountInfo<'a>,
+    pm_fee_config: &AccountInfo<'a>,
+    locked_amount: u64,
+    settlement_amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    msg!("CPI: SettleToAvailableWithFee - locked: {}, settlement: {}", locked_amount, settlement_amount);
+
+    let mut data = vec![49u8];
+    data.extend_from_slice(&locked_amount.to_le_bytes());
+    data.extend_from_slice(&settlement_amount.to_le_bytes());
+
+    let accounts = vec![
+        vault_config.clone(),
+        user_account.clone(),
+        pm_user_account.clone(),
+        caller_program.clone(),
+        pm_fee_config.clone(),
+    ];
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *vault_program.key,
+        accounts: accounts.iter().map(|a| {
+            solana_program::instruction::AccountMeta {
+                pubkey: *a.key,
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            }
+        }).collect(),
+        data,
+    };
+
+    invoke_signed(&ix, &accounts, &[signer_seeds])?;
+
+    Ok(())
+}
+
 /// Settle prediction market winnings with auto-init support (CPI to Vault Program)
 /// 
 /// This version supports automatic creation of PMUserAccount if it doesn't exist.
