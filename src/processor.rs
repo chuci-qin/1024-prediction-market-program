@@ -2913,7 +2913,7 @@ fn process_match_mint_v2(
         let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
         
         // Collect Taker fee from YES buyer
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -2924,10 +2924,12 @@ fn process_match_mint_v2(
             yes_cost,
             true, // is_taker
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Taker fee CPI failed for YES buyer (MintV2), will reconcile: {:?}", e);
+        }
         
         // Collect Taker fee from NO buyer  
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -2938,7 +2940,9 @@ fn process_match_mint_v2(
             no_cost,
             true, // is_taker
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Taker fee CPI failed for NO buyer (MintV2), will reconcile: {:?}", e);
+        }
         
         msg!("✅ Trading fees collected for MatchMintV2");
     } else {
@@ -3177,7 +3181,7 @@ fn process_match_burn_v2(
         let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
         
         // Collect Maker fee from YES seller
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -3188,10 +3192,12 @@ fn process_match_burn_v2(
             yes_proceeds,
             false, // is_maker
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Maker fee CPI failed for YES seller (BurnV2), will reconcile: {:?}", e);
+        }
         
         // Collect Maker fee from NO seller
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -3202,7 +3208,9 @@ fn process_match_burn_v2(
             no_proceeds,
             false, // is_maker
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Maker fee CPI failed for NO seller (BurnV2), will reconcile: {:?}", e);
+        }
         
         msg!("✅ Trading fees collected for MatchBurnV2");
     } else {
@@ -3855,7 +3863,7 @@ fn process_execute_trade_v2(
         let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
         
         // Collect Taker fee from buyer
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -3866,10 +3874,12 @@ fn process_execute_trade_v2(
             trade_cost,
             true, // Taker (buyer)
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Taker fee CPI failed for buyer (TradeV2), will reconcile: {:?}", e);
+        }
         
         // Collect Maker fee from seller
-        let _ = cpi_trade_with_fee(
+        if let Err(e) = cpi_trade_with_fee(
             vault_program_info,
             vault_config_info,
             config_info,
@@ -3880,7 +3890,9 @@ fn process_execute_trade_v2(
             trade_cost,
             false, // Maker (seller)
             config_seeds,
-        );
+        ) {
+            msg!("WARNING: Maker fee CPI failed for seller (TradeV2), will reconcile: {:?}", e);
+        }
         
         msg!("✅ Trading fees collected for ExecuteTradeV2");
     }
@@ -6169,6 +6181,10 @@ fn process_propose_result_manual(
     market.status = MarketStatus::ResultProposed;
     market.updated_at = current_time;
     market.serialize(&mut &mut market_info.data.borrow_mut()[..])?;
+    
+    // Structured log for chain sync parsing (must match LOG_PREFIX_RESULT_PROPOSED in sync.rs)
+    msg!("result_proposed:{},{},{},{}", 
+         args.market_id, oracle_admin_info.key, args.outcome_index, 0);
     
     msg!("✅ Manual proposal for market {}: outcome={}, manual_cid={:?}", 
          args.market_id, 
