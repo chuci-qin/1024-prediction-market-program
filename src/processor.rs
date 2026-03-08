@@ -896,6 +896,8 @@ fn process_create_market(
     msg!("Resolution Time: {}", args.resolution_time);
     msg!("Creator Fee: {} bps", args.creator_fee_bps);
     
+    msg!("market_created:{},{},{},{},{},{}", market_id, creator_info.key, yes_mint_info.key, no_mint_info.key, market_vault_info.key, args.resolution_time);
+    
     Ok(())
 }
 
@@ -1182,6 +1184,8 @@ fn process_create_multi_outcome_market(
     msg!("Market Vault: {}", market_vault_info.key);
     msg!("Resolution Time: {}", args.resolution_time);
     msg!("Creator Fee: {} bps", args.creator_fee_bps);
+    
+    msg!("multi_outcome_market_created:{},{},{},{}", market_id, creator_info.key, args.num_outcomes, args.resolution_time);
     
     Ok(())
 }
@@ -2439,6 +2443,7 @@ fn process_relayer_mint_complete_set_v2(
     msg!("Amount: {}", args.amount);
     msg!("Position YES: {}, NO: {}", position.yes_amount, position.no_amount);
     msg!("Total Minted: {}", market.total_minted);
+    msg!("complete_set_minted:{},{},{},{}", args.market_id, args.user_wallet, args.amount, args.amount);
     
     Ok(())
 }
@@ -2580,6 +2585,7 @@ fn process_relayer_redeem_complete_set_v2(
     msg!("Amount: {}", args.amount);
     msg!("Position YES: {}, NO: {}", position.yes_amount, position.no_amount);
     msg!("Total Minted: {}", market.total_minted);
+    msg!("complete_set_redeemed:{},{},{},{}", args.market_id, args.user_wallet, args.amount, args.amount);
     
     Ok(())
 }
@@ -3419,6 +3425,7 @@ fn process_relayer_claim_winnings_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Market status: {:?}", market.status);
     msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
+    msg!("winnings_claimed:{},{},{}", args.market_id, args.user_wallet, settlement_amount);
     
     Ok(())
 }
@@ -3904,6 +3911,8 @@ fn process_execute_trade_v2(
     msg!("Amount: {}, Price: {}, Cost: {}", match_amount, exec_price, trade_cost);
     msg!("Buyer: {}", buy_order.owner);
     msg!("Seller: {}", sell_order.owner);
+    let outcome_u8 = outcome as u8;
+    msg!("trade_executed:{},{},{},{},{},{},{},{}", args.market_id, args.taker_order_id, args.maker_order_id, buy_order.owner, sell_order.owner, outcome_u8, exec_price, match_amount);
     
     Ok(())
 }
@@ -4912,6 +4921,10 @@ fn process_relayer_place_order_v2(
     msg!("Order ID: {}, Market: {}", order_id, args.market_id);
     msg!("Side: {:?}, Outcome: {:?}", args.side, args.outcome);
     msg!("Price: {}, Amount: {}, Margin: {}", args.price, args.amount, margin);
+
+    let side_u8 = args.side as u8;
+    let outcome_u8 = args.outcome as u8;
+    msg!("order_placed:{},{},{},{},{},{},{}", args.market_id, order_id, args.user_wallet, side_u8, outcome_u8, args.price, args.amount);
     
     Ok(())
 }
@@ -5089,6 +5102,7 @@ fn process_relayer_cancel_order_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Order ID: {}, Market: {}", args.order_id, args.market_id);
     msg!("Remaining amount: {}, Unlocked margin: {}", remaining, remaining_margin);
+    msg!("order_cancelled:{},{}", args.market_id, args.order_id);
     
     Ok(())
 }
@@ -6568,6 +6582,8 @@ fn process_relayer_place_multi_outcome_order_v2(
     msg!("Side: {:?}, Outcome Index: {}", args.side, args.outcome_index);
     msg!("Price: {}, Amount: {}, Margin: {}", args.price, args.amount, margin);
     
+    msg!("multi_outcome_order_placed:{},{},{},{},{:?},{},{}", args.market_id, order_id, args.user_wallet, args.outcome_index, args.side, args.price, args.amount);
+    
     Ok(())
 }
 
@@ -6719,6 +6735,8 @@ fn process_relayer_cancel_multi_outcome_order_v2(
     msg!("User: {}", args.user_wallet);
     msg!("Order ID: {}, Market: {}", args.order_id, args.market_id);
     msg!("Remaining amount: {}, Unlocked margin/shares: {}", remaining, remaining_margin);
+    
+    msg!("multi_outcome_order_cancelled:{},{}", args.market_id, args.order_id);
     
     Ok(())
 }
@@ -6926,6 +6944,8 @@ fn process_relayer_mint_multi_outcome_complete_set_v2(
     msg!("Amount: {}", args.amount);
     msg!("Total Minted: {}", market.total_minted);
     
+    msg!("multi_outcome_set_minted:{},{},{},{}", args.market_id, args.user_wallet, args.amount, args.amount);
+    
     Ok(())
 }
 
@@ -7075,6 +7095,8 @@ fn process_relayer_redeem_multi_outcome_complete_set_v2(
     msg!("Market: {}", market.market_id);
     msg!("Amount: {}", args.amount);
     msg!("Total Minted: {}", market.total_minted);
+    
+    msg!("multi_outcome_set_redeemed:{},{},{},{}", args.market_id, args.user_wallet, args.amount, args.amount);
     
     Ok(())
 }
@@ -7250,6 +7272,8 @@ fn process_relayer_claim_multi_outcome_winnings_v2(
     msg!("Market: {}", market.market_id);
     msg!("Settlement: {}, PnL: {}", settlement_amount, pnl);
     
+    msg!("multi_outcome_winnings_claimed:{},{},{},{}", market.market_id, args.user_wallet, market.winning_outcome_index.unwrap_or(255), settlement_amount);
+    
     Ok(())
 }
 
@@ -7423,6 +7447,8 @@ fn process_finalize_result_v2(
     msg!("Market {} resolved with result {:?}, outcome index {}", 
          market.market_id, market.final_result, proposal_data.proposed_outcome_index);
     msg!("Bond returned: {} e6", bond_amount);
+    
+    msg!("result_finalized:{},{}", market.market_id, proposal_data.proposed_outcome_index);
     
     Ok(())
 }
