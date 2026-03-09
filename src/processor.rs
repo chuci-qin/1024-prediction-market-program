@@ -40,7 +40,6 @@ use crate::cpi::{
     cpi_settle_to_available_with_fee,
     cpi_lock_for_prediction_with_fee,
     cpi_release_from_prediction_with_fee,
-    cpi_trade_with_fee,
     cpi_settle_with_fee,
 };
 use crate::token_compat;
@@ -1257,6 +1256,7 @@ fn process_activate_market(
     config.serialize(&mut *config_info.data.borrow_mut())?;
     
     msg!("Market {} activated successfully", args.market_id);
+    msg!("market_status_changed:{},{},{}", args.market_id, "Active", current_time);
     
     Ok(())
 }
@@ -1319,6 +1319,7 @@ fn process_pause_market(
     config.serialize(&mut *config_info.data.borrow_mut())?;
     
     msg!("Market {} paused successfully", args.market_id);
+    msg!("market_status_changed:{},{},{}", args.market_id, "Paused", current_time);
     
     Ok(())
 }
@@ -1380,6 +1381,7 @@ fn process_resume_market(
     config.serialize(&mut *config_info.data.borrow_mut())?;
     
     msg!("Market {} resumed successfully", args.market_id);
+    msg!("market_status_changed:{},{},{}", args.market_id, "Active", current_time);
     
     Ok(())
 }
@@ -1452,6 +1454,7 @@ fn process_cancel_market(
     }
     
     msg!("Market {} cancelled successfully. Reason: {}", args.market_id, args.reason);
+    msg!("market_status_changed:{},{},{}", args.market_id, "Cancelled", current_time);
     
     Ok(())
 }
@@ -2899,63 +2902,6 @@ fn process_match_mint_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
-    // Step 7: Optional Fee Collection (V2.1 architecture)
-    // If fee accounts are provided, collect trading fees
-    // Account 14: Vault Token Account (optional)
-    // Account 15: PM Fee Vault (optional)
-    // Account 16: PM Fee Config (optional)
-    // Account 17: Token Program (optional)
-    let vault_token_account = next_account_info(account_info_iter).ok();
-    let pm_fee_vault = next_account_info(account_info_iter).ok();
-    let pm_fee_config = next_account_info(account_info_iter).ok();
-    let token_program = next_account_info(account_info_iter).ok();
-    
-    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
-        msg!("Fee accounts detected, collecting trading fees...");
-        
-        let (config_pda, config_bump) = Pubkey::find_program_address(
-            &[PM_CONFIG_SEED],
-            program_id,
-        );
-        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
-        
-        // Collect Taker fee from YES buyer
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            yes_cost,
-            true, // is_taker
-            config_seeds,
-        ) {
-            msg!("WARNING: Taker fee CPI failed for YES buyer (MintV2), will reconcile: {:?}", e);
-        }
-        
-        // Collect Taker fee from NO buyer  
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            no_cost,
-            true, // is_taker
-            config_seeds,
-        ) {
-            msg!("WARNING: Taker fee CPI failed for NO buyer (MintV2), will reconcile: {:?}", e);
-        }
-        
-        msg!("✅ Trading fees collected for MatchMintV2");
-    } else {
-        msg!("Fee accounts not provided, skipping fee collection");
-    }
-    
     msg!("✅ MatchMintV2 completed");
     msg!("Amount: {}", match_amount);
     msg!("YES cost: {}, NO cost: {}", yes_cost, no_cost);
@@ -3170,59 +3116,6 @@ fn process_match_burn_v2(
     market.total_volume_e6 = market.total_volume_e6.saturating_add((yes_proceeds + no_proceeds) as i64);
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
-    
-    // Step 6: Optional Fee Collection (V2.1 architecture)
-    // If fee accounts are provided, collect trading fees
-    let vault_token_account = next_account_info(account_info_iter).ok();
-    let pm_fee_vault = next_account_info(account_info_iter).ok();
-    let pm_fee_config = next_account_info(account_info_iter).ok();
-    let token_program = next_account_info(account_info_iter).ok();
-    
-    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
-        msg!("Fee accounts detected, collecting trading fees...");
-        
-        let (config_pda, config_bump) = Pubkey::find_program_address(
-            &[PM_CONFIG_SEED],
-            program_id,
-        );
-        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
-        
-        // Collect Maker fee from YES seller
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            yes_proceeds,
-            false, // is_maker
-            config_seeds,
-        ) {
-            msg!("WARNING: Maker fee CPI failed for YES seller (BurnV2), will reconcile: {:?}", e);
-        }
-        
-        // Collect Maker fee from NO seller
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            no_proceeds,
-            false, // is_maker
-            config_seeds,
-        ) {
-            msg!("WARNING: Maker fee CPI failed for NO seller (BurnV2), will reconcile: {:?}", e);
-        }
-        
-        msg!("✅ Trading fees collected for MatchBurnV2");
-    } else {
-        msg!("Fee accounts not provided, skipping fee collection");
-    }
     
     msg!("✅ MatchBurnV2 completed");
     msg!("Amount: {}", match_amount);
@@ -3875,56 +3768,6 @@ fn process_execute_trade_v2(
     market.updated_at = current_time;
     market.serialize(&mut *market_info.data.borrow_mut())?;
     
-    // Step 6: Optional Fee Collection (V2.1 architecture)
-    let vault_token_account = next_account_info(account_info_iter).ok();
-    let pm_fee_vault = next_account_info(account_info_iter).ok();
-    let pm_fee_config = next_account_info(account_info_iter).ok();
-    let token_program = next_account_info(account_info_iter).ok();
-    
-    if let (Some(vta), Some(pfv), Some(pfc), Some(tp)) = (vault_token_account, pm_fee_vault, pm_fee_config, token_program) {
-        msg!("Fee accounts detected, collecting trading fees...");
-        
-        let (config_pda, config_bump) = Pubkey::find_program_address(
-            &[PM_CONFIG_SEED],
-            program_id,
-        );
-        let config_seeds: &[&[u8]] = &[PM_CONFIG_SEED, &[config_bump]];
-        
-        // Collect Taker fee from buyer
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            trade_cost,
-            true, // Taker (buyer)
-            config_seeds,
-        ) {
-            msg!("WARNING: Taker fee CPI failed for buyer (TradeV2), will reconcile: {:?}", e);
-        }
-        
-        // Collect Maker fee from seller
-        if let Err(e) = cpi_trade_with_fee(
-            vault_program_info,
-            vault_config_info,
-            config_info,
-            vta,
-            pfv,
-            pfc,
-            tp,
-            trade_cost,
-            false, // Maker (seller)
-            config_seeds,
-        ) {
-            msg!("WARNING: Maker fee CPI failed for seller (TradeV2), will reconcile: {:?}", e);
-        }
-        
-        msg!("✅ Trading fees collected for ExecuteTradeV2");
-    }
-    
     // Emit success log
     msg!("✅ ExecuteTradeV2 completed");
     msg!("Market: {}, Outcome: {:?}", args.market_id, outcome);
@@ -4234,6 +4077,9 @@ fn process_execute_multi_outcome_trade_v2(
     }
     
     msg!("✅ ExecuteMultiOutcomeTradeV2: m={}, amt={}", args.market_id, match_amount);
+    msg!("multi_outcome_trade_executed:{},{},{},{},{},{},{},{}", 
+         args.market_id, seller_wallet_info.key, buyer_wallet_info.key, 
+         exec_price, match_amount, args.sell_order_id, args.buy_order_id, 0u64);
     
     Ok(())
 }
@@ -5553,6 +5399,7 @@ fn process_relayer_redeem_complete_set_v2_with_fee(
     msg!("✅ RelayerRedeemCompleteSetV2WithFee completed");
     msg!("User: {}, Market: {}", args.user_wallet, args.market_id);
     msg!("Gross amount: {} (fee collected by Vault)", args.amount);
+    msg!("complete_set_redeemed:{},{},{},{}", args.market_id, args.user_wallet, args.amount, args.amount);
     
     Ok(())
 }
@@ -5868,6 +5715,7 @@ fn process_halt_trading(
     
     msg!("✅ Halted trading for market {} (resolution time: {})", 
          args.market_id, market.resolution_time);
+    msg!("market_status_changed:{},{},{}", args.market_id, "TradingHalted", current_time);
     
     Ok(())
 }
@@ -7470,6 +7318,9 @@ fn process_finalize_result_v2(
     msg!("Bond returned: {} e6", bond_amount);
     
     msg!("result_finalized:{},{}", market.market_id, proposal_data.proposed_outcome_index);
+    if market.market_type == MarketType::MultiOutcome {
+        msg!("multi_outcome_result_finalized:{},{}", market.market_id, proposal_data.proposed_outcome_index);
+    }
     
     Ok(())
 }

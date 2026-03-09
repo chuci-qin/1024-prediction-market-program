@@ -448,61 +448,6 @@ pub fn cpi_release_from_prediction_with_fee<'a>(
     Ok(())
 }
 
-/// CPI to Vault.PredictionMarketTradeWithFee (index 23)
-/// 
-/// Collects trading fee from a trade. Does not modify user balances.
-/// 
-/// Accounts:
-/// 0. VaultConfig
-/// 1. Caller Program
-/// 2. Vault Token Account
-/// 3. PM Fee Vault
-/// 4. PM Fee Config
-/// 5. Token Program
-pub fn cpi_trade_with_fee<'a>(
-    vault_program: &AccountInfo<'a>,
-    vault_config: &AccountInfo<'a>,
-    caller_program: &AccountInfo<'a>,
-    vault_token_account: &AccountInfo<'a>,
-    pm_fee_vault: &AccountInfo<'a>,
-    pm_fee_config: &AccountInfo<'a>,
-    token_program: &AccountInfo<'a>,
-    trade_amount: u64,
-    is_taker: bool,
-    signer_seeds: &[&[u8]],
-) -> ProgramResult {
-    msg!("CPI: Trade fee for amount={}, is_taker={}", trade_amount, is_taker);
-    
-    // Instruction index for PredictionMarketTradeWithFee = 23
-    let mut data = vec![23u8];
-    data.extend_from_slice(&trade_amount.to_le_bytes());
-    data.push(if is_taker { 1 } else { 0 });
-    
-    let accounts = vec![
-        vault_config.clone(),
-        caller_program.clone(),
-        vault_token_account.clone(),
-        pm_fee_vault.clone(),
-        pm_fee_config.clone(),
-        token_program.clone(),
-    ];
-    
-    let ix = solana_program::instruction::Instruction {
-        program_id: *vault_program.key,
-        accounts: accounts.iter().map(|a| {
-            solana_program::instruction::AccountMeta {
-                pubkey: *a.key,
-                is_signer: a.is_signer,
-                is_writable: a.is_writable,
-            }
-        }).collect(),
-        data,
-    };
-    
-    invoke_signed(&ix, &accounts, &[signer_seeds])?;
-    
-    Ok(())
-}
 
 /// CPI to Vault.PredictionMarketSettleWithFee (index 24)
 /// 
